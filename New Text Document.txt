@@ -1,0 +1,3480 @@
+✅ STEP 1 — Project Setup & Folder Structure
+1.1 — Install Prerequisites
+bash# Install Node.js (v18+)
+https://nodejs.org
+
+# Install Python (3.9+)
+https://python.org
+
+# Install MongoDB Community
+https://www.mongodb.com/try/download/community
+1.2 — Create Full Project Structure
+Run these commands in your terminal:
+bash# Root project folder
+mkdir kirana-demand-system
+cd kirana-demand-system
+
+# --- BACKEND (Node/Express) ---
+mkdir backend
+cd backend
+npm init -y
+npm install express mongoose cors dotenv axios
+npm install --save-dev nodemon
+cd ..
+
+# --- ML SERVICE (Python/Flask) ---
+mkdir ml-service
+cd ml-service
+python -m venv venv
+
+# Activate venv:
+# Windows:  venv\Scripts\activate
+# Mac/Linux: source venv/bin/activate
+
+pip install flask prophet pandas numpy scikit-learn flask-cors
+cd ..
+
+# --- FRONTEND (React) ---
+npx create-react-app frontend
+cd frontend
+npm install axios recharts react-router-dom lucide-react
+cd ..
+1.3 — Final Folder Structure
+kirana-demand-system/
+│
+├── backend/
+│   ├── models/
+│   │   ├── Product.js          ← Product catalog
+│   │   └── Sale.js             ← Daily sales records
+│   ├── routes/
+│   │   ├── products.js         ← CRUD for products
+│   │   ├── sales.js            ← CRUD for sales
+│   │   └── predictions.js      ← Calls ML service
+│   ├── seed/
+│   │   └── seedData.js         ← Sample kirana data
+│   ├── .env
+│   └── server.js
+│
+├── ml-service/
+│   ├── model/
+│   │   └── train.py            ← Prophet training logic
+│   ├── app.py                  ← Flask API server
+│   └── requirements.txt
+│
+└── frontend/
+    └── src/
+        ├── components/
+        │   ├── Dashboard.jsx
+        │   ├── StockAlert.jsx
+        │   ├── PredictionChart.jsx
+        │   └── ProductTable.jsx
+        ├── pages/
+        │   ├── Home.jsx
+        │   └── Predictions.jsx
+        ├── api/
+        │   └── index.js        ← Axios API calls
+        └── App.jsx
+1.4 — Backend .env file
+Create backend/.env:
+envPORT=5000
+MONGO_URI=mongodb://localhost:27017/kirana_db
+ML_SERVICE_URL=http://localhost:8000
+
+✅ STEP 2 — MongoDB Schemas
+backend/models/Product.js
+jsconst mongoose = require('mongoose');
+
+const ProductSchema = new mongoose.Schema({
+  name: { type: String, required: true },       // "Rice", "Dal"
+  category: { type: String, required: true },   // "Grains", "Oil"
+  unit: { type: String, default: 'kg' },        // kg, litre, piece
+  currentStock: { type: Number, default: 0 },   // current qty
+  minThreshold: { type: Number, default: 5 },   // reorder level
+  costPrice: { type: Number },
+  sellingPrice: { type: Number },
+}, { timestamps: true });
+
+module.exports = mongoose.model('Product', ProductSchema);
+backend/models/Sale.js
+jsconst mongoose = require('mongoose');
+
+const SaleSchema = new mongoose.Schema({
+  productId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Product',
+    required: true
+  },
+  productName: { type: String },    // denormalized for ML
+  date: { type: Date, required: true },
+  quantitySold: { type: Number, required: true },
+  revenue: { type: Number },
+}, { timestamps: true });
+
+// Index for fast time-series queries
+SaleSchema.index({ productId: 1, date: 1 });
+
+module.exports = mongoose.model('Sale', SaleSchema);
+
+✅ STEP 3 — Express Server + APIs
+backend/server.js
+jsconst express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+require('dotenv').config();
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// Routes
+app.use('/api/products',    require('./routes/products'));
+app.use('/api/sales',       require('./routes/sales'));
+app.use('/api/predictions', require('./routes/predictions'));
+
+// Health check
+app.get('/', (req, res) => res.json({ status: 'Kirana API running ✅' }));
+
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => {
+    console.log('MongoDB connected ✅');
+    app.listen(process.env.PORT, () =>
+      console.log(`Server on port ${process.env.PORT} ✅`)
+    );
+  })
+  .catch(err => console.error(err));
+backend/routes/products.js
+jsconst router = require('express').Router();
+const Product = require('../models/Product');
+
+// GET all products with stock status
+router.get('/', async (req, res) => {
+  try {
+    const products = await Product.find();
+    const withStatus = products.map(p => ({
+      ...p._doc,
+      stockStatus: p.currentStock <= p.minThreshold ? 'LOW' : 'SUFFICIENT'
+    }));
+    res.json(withStatus);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST create product
+router.post('/', async (req, res) => {
+  try {
+    const product = await Product.create(req.body);
+    res.status(201).json(product);
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// PUT update stock
+router.put('/:id/stock', async (req, res) => {
+  try {
+    const product = await Product.findByIdAndUpdate(
+      req.params.id,
+      { currentStock: req.body.currentStock },
+      { new: true }
+    );
+    res.json(product);
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+module.exports = router;
+backend/routes/sales.js
+jsconst router = require('express').Router();
+const Sale = require('../models/Sale');
+
+// GET sales for a product (last N days)
+router.get('/:productId', async (req, res) => {
+  try {
+    const days = parseInt(req.query.days) || 90;
+    const since = new Date();
+    since.setDate(since.getDate() - days);
+
+    const sales = await Sale.find({
+      productId: req.params.productId,
+      date: { $gte: since }
+    }).sort({ date: 1 });
+
+    res.json(sales);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST record a sale
+router.post('/', async (req, res) => {
+  try {
+    const sale = await Sale.create(req.body);
+    res.status(201).json(sale);
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+module.exports = router;
+backend/routes/predictions.js
+jsconst router = require('express').Router();
+const axios = require('axios');
+const Sale = require('../models/Sale');
+require('dotenv').config();
+
+router.get('/:productId', async (req, res) => {
+  try {
+    // 1. Fetch last 90 days of sales from MongoDB
+    const since = new Date();
+    since.setDate(since.getDate() - 90);
+
+    const sales = await Sale.find({
+      productId: req.params.productId,
+      date: { $gte: since }
+    }).sort({ date: 1 });
+
+    if (sales.length < 10) {
+      return res.status(400).json({
+        error: 'Not enough data. Need at least 10 days of sales history.'
+      });
+    }
+
+    // 2. Format for Prophet: [{ds: "2024-01-01", y: 5.2}, ...]
+    const timeSeriesData = sales.map(s => ({
+      ds: s.date.toISOString().split('T')[0],
+      y: s.quantitySold
+    }));
+
+    // 3. Call Python ML service
+    const mlResponse = await axios.post(
+      `${process.env.ML_SERVICE_URL}/predict`,
+      {
+        data: timeSeriesData,
+        periods: parseInt(req.query.days) || 7  // forecast next 7 days
+      }
+    );
+
+    res.json(mlResponse.data);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+module.exports = router;
+
+✅ STEP 4 — Python Flask + Prophet ML Service
+ml-service/app.py
+pythonfrom flask import Flask, request, jsonify
+from flask_cors import CORS
+from prophet import Prophet
+import pandas as pd
+import numpy as np
+
+app = Flask(__name__)
+CORS(app)
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"status": "ML service running ✅"})
+
+@app.route('/predict', methods=['POST'])
+def predict():
+    try:
+        body = request.get_json()
+        data = body.get('data', [])
+        periods = body.get('periods', 7)
+
+        # Build DataFrame
+        df = pd.DataFrame(data)
+        df['ds'] = pd.to_datetime(df['ds'])
+        df['y'] = pd.to_numeric(df['y'])
+
+        # Aggregate duplicates (same day multiple sales)
+        df = df.groupby('ds', as_index=False)['y'].sum()
+
+        # Train Prophet model
+        model = Prophet(
+            daily_seasonality=False,
+            weekly_seasonality=True,   # kirana shops have weekly patterns
+            yearly_seasonality=False,
+            changepoint_prior_scale=0.3
+        )
+        model.fit(df)
+
+        # Forecast next N days
+        future = model.make_future_dataframe(periods=periods)
+        forecast = model.predict(future)
+
+        # Extract only future predictions
+        future_only = forecast[forecast['ds'] > df['ds'].max()]
+
+        result = []
+        for _, row in future_only.iterrows():
+            predicted_qty = max(0, round(row['yhat'], 2))
+            result.append({
+                "date": row['ds'].strftime('%Y-%m-%d'),
+                "predictedQty": predicted_qty,
+                "lower": max(0, round(row['yhat_lower'], 2)),
+                "upper": max(0, round(row['yhat_upper'], 2)),
+            })
+
+        # Calculate total demand for forecast window
+        total_demand = sum(r['predictedQty'] for r in result)
+
+        return jsonify({
+            "forecast": result,
+            "totalPredictedDemand": round(total_demand, 2),
+            "forecastDays": periods,
+            "modelInfo": {
+                "dataPointsUsed": len(df),
+                "algorithm": "Facebook Prophet (Time-Series)"
+            }
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(port=8000, debug=True)
+
+✅ STEP 5 — Seed Data (to test ML)
+backend/seed/seedData.js
+js// Run: node seed/seedData.js
+require('dotenv').config({ path: '../.env' });
+const mongoose = require('mongoose');
+const Product = require('../models/Product');
+const Sale = require('../models/Sale');
+
+const products = [
+  { name: 'Rice',        category: 'Grains', unit: 'kg',     currentStock: 50, minThreshold: 10 },
+  { name: 'Dal',         category: 'Grains', unit: 'kg',     currentStock: 4,  minThreshold: 8  },
+  { name: 'Sunflower Oil', category: 'Oil',  unit: 'litre',  currentStock: 15, minThreshold: 5  },
+  { name: 'Sugar',       category: 'Grains', unit: 'kg',     currentStock: 3,  minThreshold: 10 },
+  { name: 'Tea Powder',  category: 'Beverage', unit: 'kg',   currentStock: 6,  minThreshold: 4  },
+];
+
+async function seed() {
+  await mongoose.connect('mongodb://localhost:27017/kirana_db');
+  await Product.deleteMany();
+  await Sale.deleteMany();
+
+  const created = await Product.insertMany(products);
+  console.log('Products seeded ✅');
+
+  // Generate 90 days of realistic sales data
+  const salesDocs = [];
+  const today = new Date();
+
+  for (const product of created) {
+    for (let i = 90; i >= 1; i--) {
+      const date = new Date(today);
+      date.setDate(date.getDate() - i);
+
+      // Simulate weekly pattern: higher on weekends
+      const dayOfWeek = date.getDay();
+      const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
+      const baseQty = product.name === 'Rice' ? 8 : 3;
+      const qty = baseQty + (isWeekend ? 3 : 0) + (Math.random() * 3 - 1);
+
+      salesDocs.push({
+        productId: product._id,
+        productName: product.name,
+        date,
+        quantitySold: Math.max(0.5, parseFloat(qty.toFixed(2))),
+        revenue: parseFloat((qty * (product.sellingPrice || 50)).toFixed(2))
+      });
+    }
+  }
+
+  await Sale.insertMany(salesDocs);
+  console.log(`${salesDocs.length} sales records seeded ✅`);
+  mongoose.disconnect();
+}
+
+seed().catch(console.error);
+
+✅ STEP 6 — Run Everything
+bash# Terminal 1: Start MongoDB
+mongod
+
+# Terminal 2: Seed data, then start backend
+cd backend
+node seed/seedData.js     # run once
+npm run dev               # add "dev": "nodemon server.js" in package.json
+
+# Terminal 3: Start ML service 
+cd ml-service
+source venv/bin/activate  # or venv\Scripts\activate on Windows  or .\venv\Scripts\Activate.ps1
+python app.py
+
+# Terminal 4: Start React frontend
+cd frontend
+npm start
+Test the Prediction API
+bash# Get all products
+curl http://localhost:5000/api/products
+
+# Predict next 7 days for a product (use _id from above)
+curl http://localhost:5000/api/predictions/PRODUCT_ID?days=7
+
+🔜 Next: React Dashboard
+Once you confirm the backend + ML service is working, we'll build:
+
+Stock status cards (LOW / SUFFICIENT badges)
+Prediction charts with Recharts
+Alerts panel for items needing reorder
+
+Your next step: Run the setup commands and let me know once MongoDB + Node + Python are installed, or if you hit any errors! Which part do you want to tackle first?
+
+9:56 pmClaude responded: Let's build the React Frontend!Let's build the React Frontend! Starting with Step 7.
+
+✅ STEP 7 — App.jsx + Routing Setup
+frontend/src/api/index.js
+jsimport axios from 'axios';
+
+const API = axios.create({ baseURL: 'http://localhost:5000/api' });
+
+export const getProducts    = ()         => API.get('/products');
+export const updateStock    = (id, qty)  => API.put(`/products/${id}/stock`, { currentStock: qty });
+export const getSales       = (id, days) => API.get(`/sales/${id}?days=${days}`);
+export const getPrediction  = (id, days) => API.get(`/predictions/${id}?days=${days}`);
+export const recordSale     = (data)     => API.post('/sales', data);
+export const createProduct  = (data)     => API.post('/products', data);
+frontend/src/App.jsx
+jsximport { BrowserRouter, Routes, Route } from 'react-router-dom';
+import Navbar from './components/Navbar';
+import Home from './pages/Home';
+import Predictions from './pages/Predictions';
+import ReorderReport from './pages/ReorderReport';
+import RecordSale from './pages/RecordSale';
+
+export default function App() {
+  return (
+    <BrowserRouter>
+      <div className="min-h-screen bg-gray-50">
+        <Navbar />
+        <div className="max-w-7xl mx-auto px-4 py-6">
+          <Routes>
+            <Route path="/"           element={<Home />} />
+            <Route path="/predictions" element={<Predictions />} />
+            <Route path="/reorder"    element={<ReorderReport />} />
+            <Route path="/record-sale" element={<RecordSale />} />
+          </Routes>
+        </div>
+      </div>
+    </BrowserRouter>
+  );
+}
+frontend/src/components/Navbar.jsx
+jsximport { Link, useLocation } from 'react-router-dom';
+import { ShoppingBasket, BarChart2, ClipboardList, PlusCircle } from 'lucide-react';
+
+const links = [
+  { to: '/',             label: 'Dashboard',    icon: ShoppingBasket },
+  { to: '/predictions',  label: 'Predictions',  icon: BarChart2 },
+  { to: '/reorder',      label: 'Reorder',      icon: ClipboardList },
+  { to: '/record-sale',  label: 'Record Sale',  icon: PlusCircle },
+];
+
+export default function Navbar() {
+  const { pathname } = useLocation();
+  return (
+    <nav className="bg-green-700 text-white shadow-lg">
+      <div className="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
+        <span className="text-xl font-bold tracking-wide">🛒 KiranaAI</span>
+        <div className="flex gap-2">
+          {links.map(({ to, label, icon: Icon }) => (
+            <Link key={to} to={to}
+              className={`flex items-center gap-1 px-3 py-2 rounded-md text-sm font-medium transition
+                ${pathname === to ? 'bg-green-900' : 'hover:bg-green-600'}`}>
+              <Icon size={16} /> {label}
+            </Link>
+          ))}
+        </div>
+      </div>
+    </nav>
+  );
+}
+
+✅ STEP 8 — Dashboard Page (Stock Overview Cards)
+frontend/src/components/StockCard.jsx
+jsxexport default function StockCard({ product, onClick }) {
+  const isLow = product.stockStatus === 'LOW';
+  return (
+    <div
+      onClick={() => onClick(product)}
+      className={`cursor-pointer rounded-xl p-4 shadow-md border-l-4 transition hover:scale-105
+        ${isLow ? 'border-red-500 bg-red-50' : 'border-green-500 bg-green-50'}`}>
+
+      <div className="flex justify-between items-start">
+        <div>
+          <h3 className="font-bold text-gray-800 text-lg">{product.name}</h3>
+          <p className="text-sm text-gray-500">{product.category}</p>
+        </div>
+        <span className={`text-xs font-bold px-2 py-1 rounded-full
+          ${isLow ? 'bg-red-200 text-red-700' : 'bg-green-200 text-green-700'}`}>
+          {isLow ? '⚠ LOW' : '✓ OK'}
+        </span>
+      </div>
+
+      <div className="mt-3 flex justify-between text-sm">
+        <div>
+          <p className="text-gray-500">Current Stock</p>
+          <p className="font-semibold text-gray-800">
+            {product.currentStock} {product.unit}
+          </p>
+        </div>
+        <div className="text-right">
+          <p className="text-gray-500">Min Level</p>
+          <p className="font-semibold text-gray-800">
+            {product.minThreshold} {product.unit}
+          </p>
+        </div>
+      </div>
+
+      {/* Stock bar */}
+      <div className="mt-3 w-full bg-gray-200 rounded-full h-2">
+        <div
+          className={`h-2 rounded-full transition-all
+            ${isLow ? 'bg-red-500' : 'bg-green-500'}`}
+          style={{
+            width: `${Math.min(100,
+              (product.currentStock / (product.minThreshold * 3)) * 100
+            )}%`
+          }}
+        />
+      </div>
+    </div>
+  );
+}
+frontend/src/pages/Home.jsx
+jsximport { useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { getProducts } from '../api';
+import StockCard from '../components/StockCard';
+import { AlertTriangle, CheckCircle, Package } from 'lucide-react';
+
+export default function Home() {
+  const [products, setProducts] = useState([]);
+  const [loading, setLoading]   = useState(true);
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    getProducts()
+      .then(res => setProducts(res.data))
+      .finally(() => setLoading(false));
+  }, []);
+
+  const lowStock  = products.filter(p => p.stockStatus === 'LOW');
+  const okStock   = products.filter(p => p.stockStatus === 'SUFFICIENT');
+
+  if (loading) return (
+    <div className="flex justify-center items-center h-64 text-gray-500">
+      Loading stock data...
+    </div>
+  );
+
+  return (
+    <div>
+      <h1 className="text-2xl font-bold text-gray-800 mb-6">📊 Stock Dashboard</h1>
+
+      {/* Summary Cards */}
+      <div className="grid grid-cols-3 gap-4 mb-8">
+        <div className="bg-white rounded-xl p-4 shadow text-center">
+          <Package className="mx-auto text-blue-500 mb-2" size={28} />
+          <p className="text-2xl font-bold text-gray-800">{products.length}</p>
+          <p className="text-sm text-gray-500">Total Products</p>
+        </div>
+        <div className="bg-white rounded-xl p-4 shadow text-center">
+          <AlertTriangle className="mx-auto text-red-500 mb-2" size={28} />
+          <p className="text-2xl font-bold text-red-600">{lowStock.length}</p>
+          <p className="text-sm text-gray-500">Low Stock Items</p>
+        </div>
+        <div className="bg-white rounded-xl p-4 shadow text-center">
+          <CheckCircle className="mx-auto text-green-500 mb-2" size={28} />
+          <p className="text-2xl font-bold text-green-600">{okStock.length}</p>
+          <p className="text-sm text-gray-500">Sufficient Stock</p>
+        </div>
+      </div>
+
+      {/* Low Stock Alert */}
+      {lowStock.length > 0 && (
+        <div className="bg-red-50 border border-red-200 rounded-xl p-4 mb-6">
+          <h2 className="text-red-700 font-bold mb-1">⚠️ Reorder Needed</h2>
+          <p className="text-red-600 text-sm">
+            {lowStock.map(p => p.name).join(', ')} — stocks are below minimum threshold.
+          </p>
+          <button
+            onClick={() => navigate('/reorder')}
+            className="mt-2 text-sm bg-red-600 text-white px-4 py-1 rounded-lg hover:bg-red-700">
+            View Reorder Report →
+          </button>
+        </div>
+      )}
+
+      {/* Low Stock Grid */}
+      {lowStock.length > 0 && (
+        <>
+          <h2 className="text-lg font-semibold text-red-600 mb-3">⚠ Needs Reorder</h2>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-6">
+            {lowStock.map(p => (
+              <StockCard key={p._id} product={p}
+                onClick={() => navigate('/predictions', { state: { product: p } })} />
+            ))}
+          </div>
+        </>
+      )}
+
+      {/* Sufficient Stock Grid */}
+      <h2 className="text-lg font-semibold text-green-700 mb-3">✓ Sufficient Stock</h2>
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+        {okStock.map(p => (
+          <StockCard key={p._id} product={p}
+            onClick={() => navigate('/predictions', { state: { product: p } })} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+✅ STEP 9, 10, 11 — Predictions Page (Chart + Forecast)
+frontend/src/components/PredictionChart.jsx
+jsximport {
+  ComposedChart, Line, Area, Bar, XAxis, YAxis,
+  CartesianGrid, Tooltip, Legend, ResponsiveContainer
+} from 'recharts';
+
+export default function PredictionChart({ salesData, forecastData }) {
+  // Merge historical + forecast
+  const historical = salesData.map(s => ({
+    date: s.date.split('T')[0],
+    actual: s.quantitySold,
+  }));
+
+  const forecast = forecastData.map(f => ({
+    date: f.date,
+    predicted: f.predictedQty,
+    lower: f.lower,
+    upper: f.upper,
+  }));
+
+  const combined = [...historical.slice(-30), ...forecast]; // last 30 days + forecast
+
+  return (
+    <div className="bg-white rounded-xl p-4 shadow">
+      <h3 className="font-semibold text-gray-700 mb-4">
+        📈 Sales History + 7-Day Forecast
+      </h3>
+      <ResponsiveContainer width="100%" height={320}>
+        <ComposedChart data={combined}>
+          <CartesianGrid strokeDasharray="3 3" />
+          <XAxis dataKey="date" tick={{ fontSize: 11 }}
+            tickFormatter={d => d.slice(5)} />
+          <YAxis />
+          <Tooltip />
+          <Legend />
+          <Bar dataKey="actual" fill="#86efac" name="Actual Sales" radius={[4,4,0,0]} />
+          <Line dataKey="predicted" stroke="#f97316" strokeWidth={2}
+            dot={{ r: 4 }} name="Predicted" />
+          <Area dataKey="upper" fill="#fed7aa" stroke="none"
+            name="Upper Bound" opacity={0.4} />
+          <Area dataKey="lower" fill="#fff" stroke="none"
+            name="Lower Bound" opacity={1} />
+        </ComposedChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+frontend/src/pages/Predictions.jsx
+jsximport { useEffect, useState } from 'react';
+import { useLocation } from 'react-router-dom';
+import { getProducts, getSales, getPrediction } from '../api';
+import PredictionChart from '../components/PredictionChart';
+
+export default function Predictions() {
+  const { state }           = useLocation();
+  const [products, setProducts]   = useState([]);
+  const [selected, setSelected]   = useState(state?.product || null);
+  const [sales, setSales]         = useState([]);
+  const [forecast, setForecast]   = useState(null);
+  const [loading, setLoading]     = useState(false);
+  const [error, setError]         = useState('');
+
+  useEffect(() => {
+    getProducts().then(res => {
+      setProducts(res.data);
+      if (!selected && res.data.length) setSelected(res.data[0]);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!selected) return;
+    setLoading(true); setError(''); setForecast(null);
+
+    Promise.all([
+      getSales(selected._id, 90),
+      getPrediction(selected._id, 7)
+    ])
+    .then(([salesRes, predRes]) => {
+      setSales(salesRes.data);
+      setForecast(predRes.data);
+    })
+    .catch(err => setError(err.response?.data?.error || 'Prediction failed'))
+    .finally(() => setLoading(false));
+  }, [selected]);
+
+  const isLow = selected?.stockStatus === 'LOW';
+  const totalDemand = forecast?.totalPredictedDemand || 0;
+  const needsReorder = totalDemand > (selected?.currentStock || 0);
+
+  return (
+    <div>
+      <h1 className="text-2xl font-bold text-gray-800 mb-6">🔮 Demand Predictions</h1>
+
+      {/* Product Selector */}
+      <div className="bg-white rounded-xl p-4 shadow mb-6">
+        <label className="text-sm font-medium text-gray-600 block mb-2">
+          Select Product
+        </label>
+        <select
+          className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
+          value={selected?._id || ''}
+          onChange={e => {
+            const p = products.find(x => x._id === e.target.value);
+            setSelected(p);
+          }}>
+          {products.map(p => (
+            <option key={p._id} value={p._id}>{p.name} ({p.stockStatus})</option>
+          ))}
+        </select>
+      </div>
+
+      {/* Stock + Forecast Summary */}
+      {selected && (
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">
+          <div className="bg-white rounded-xl p-3 shadow text-center">
+            <p className="text-xs text-gray-500">Current Stock</p>
+            <p className="text-xl font-bold text-gray-800">
+              {selected.currentStock} {selected.unit}
+            </p>
+          </div>
+          <div className="bg-white rounded-xl p-3 shadow text-center">
+            <p className="text-xs text-gray-500">7-Day Demand</p>
+            <p className="text-xl font-bold text-orange-600">
+              {totalDemand} {selected.unit}
+            </p>
+          </div>
+          <div className="bg-white rounded-xl p-3 shadow text-center">
+            <p className="text-xs text-gray-500">Stock Status</p>
+            <p className={`text-xl font-bold ${isLow ? 'text-red-600' : 'text-green-600'}`}>
+              {isLow ? '⚠ LOW' : '✓ OK'}
+            </p>
+          </div>
+          <div className="bg-white rounded-xl p-3 shadow text-center">
+            <p className="text-xs text-gray-500">Action</p>
+            <p className={`text-sm font-bold ${needsReorder ? 'text-red-600' : 'text-green-600'}`}>
+              {needsReorder ? '🛒 Reorder Now' : '✓ Sufficient'}
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Chart */}
+      {loading && (
+        <div className="text-center py-16 text-gray-500">
+          Running Prophet forecast model...
+        </div>
+      )}
+      {error && (
+        <div className="bg-red-50 border border-red-200 rounded-xl p-4 text-red-600">
+          ❌ {error}
+        </div>
+      )}
+      {!loading && forecast && sales.length > 0 && (
+        <PredictionChart salesData={sales} forecastData={forecast.forecast} />
+      )}
+
+      {/* Forecast Table */}
+      {forecast && (
+        <div className="bg-white rounded-xl p-4 shadow mt-6">
+          <h3 className="font-semibold text-gray-700 mb-3">📅 Day-by-Day Forecast</h3>
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="bg-gray-50">
+                <th className="text-left p-2">Date</th>
+                <th className="text-right p-2">Predicted Qty</th>
+                <th className="text-right p-2">Min</th>
+                <th className="text-right p-2">Max</th>
+              </tr>
+            </thead>
+            <tbody>
+              {forecast.forecast.map((f, i) => (
+                <tr key={i} className="border-t">
+                  <td className="p-2">{f.date}</td>
+                  <td className="p-2 text-right font-semibold text-orange-600">
+                    {f.predictedQty} {selected?.unit}
+                  </td>
+                  <td className="p-2 text-right text-gray-400">{f.lower}</td>
+                  <td className="p-2 text-right text-gray-400">{f.upper}</td>
+                </tr>
+              ))}
+            </tbody>
+            <tfoot>
+              <tr className="border-t bg-orange-50">
+                <td className="p-2 font-bold">Total 7-Day Demand</td>
+                <td className="p-2 text-right font-bold text-orange-700" colSpan={3}>
+                  {totalDemand} {selected?.unit}
+                </td>
+              </tr>
+            </tfoot>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+✅ STEP 12 — Record Sale + Reorder Report Pages
+frontend/src/pages/RecordSale.jsx
+jsximport { useEffect, useState } from 'react';
+import { getProducts, recordSale } from '../api';
+
+export default function RecordSale() {
+  const [products, setProducts] = useState([]);
+  const [form, setForm]         = useState({ productId: '', quantitySold: '', date: new Date().toISOString().split('T')[0] });
+  const [msg, setMsg]           = useState('');
+
+  useEffect(() => {
+    getProducts().then(res => {
+      setProducts(res.data);
+      if (res.data.length) setForm(f => ({ ...f, productId: res.data[0]._id }));
+    });
+  }, []);
+
+  const handleSubmit = async () => {
+    if (!form.productId || !form.quantitySold) return;
+    const product = products.find(p => p._id === form.productId);
+    await recordSale({
+      productId: form.productId,
+      productName: product?.name,
+      date: new Date(form.date),
+      quantitySold: parseFloat(form.quantitySold),
+    });
+    setMsg('✅ Sale recorded successfully!');
+    setForm(f => ({ ...f, quantitySold: '' }));
+    setTimeout(() => setMsg(''), 3000);
+  };
+
+  return (
+    <div className="max-w-md mx-auto">
+      <h1 className="text-2xl font-bold text-gray-800 mb-6">🧾 Record Daily Sale</h1>
+      <div className="bg-white rounded-xl p-6 shadow space-y-4">
+        <div>
+          <label className="text-sm font-medium text-gray-600">Product</label>
+          <select className="w-full border rounded-lg px-3 py-2 mt-1 text-sm"
+            value={form.productId}
+            onChange={e => setForm(f => ({ ...f, productId: e.target.value }))}>
+            {products.map(p => <option key={p._id} value={p._id}>{p.name}</option>)}
+          </select>
+        </div>
+        <div>
+          <label className="text-sm font-medium text-gray-600">Quantity Sold</label>
+          <input type="number" className="w-full border rounded-lg px-3 py-2 mt-1 text-sm"
+            value={form.quantitySold}
+            onChange={e => setForm(f => ({ ...f, quantitySold: e.target.value }))}
+            placeholder="e.g. 5.5" />
+        </div>
+        <div>
+          <label className="text-sm font-medium text-gray-600">Date</label>
+          <input type="date" className="w-full border rounded-lg px-3 py-2 mt-1 text-sm"
+            value={form.date}
+            onChange={e => setForm(f => ({ ...f, date: e.target.value }))} />
+        </div>
+        {msg && <p className="text-green-600 text-sm font-medium">{msg}</p>}
+        <button onClick={handleSubmit}
+          className="w-full bg-green-700 text-white py-2 rounded-lg font-medium hover:bg-green-800">
+          Record Sale
+        </button>
+      </div>
+    </div>
+  );
+}
+frontend/src/pages/ReorderReport.jsx
+jsximport { useEffect, useState } from 'react';
+import { getProducts, getPrediction } from '../api';
+
+export default function ReorderReport() {
+  const [report, setReport] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    getProducts().then(async res => {
+      const rows = await Promise.all(res.data.map(async p => {
+        try {
+          const pred = await getPrediction(p._id, 7);
+          const demand = pred.data.totalPredictedDemand;
+          const gap = demand - p.currentStock;
+          return {
+            ...p,
+            predictedDemand: demand,
+            suggestedOrder: Math.max(0, Math.ceil(gap)),
+            status: gap > 0 ? 'ORDER' : 'SUFFICIENT',
+          };
+        } catch {
+          return { ...p, predictedDemand: '—', suggestedOrder: '—', status: 'NO DATA' };
+        }
+      }));
+      setReport(rows);
+      setLoading(false);
+    });
+  }, []);
+
+  if (loading) return (
+    <div className="text-center py-16 text-gray-500">
+      Calculating reorder quantities...
+    </div>
+  );
+
+  return (
+    <div>
+      <h1 className="text-2xl font-bold text-gray-800 mb-6">🛒 Reorder Report</h1>
+      <div className="bg-white rounded-xl shadow overflow-hidden">
+        <table className="w-full text-sm">
+          <thead className="bg-green-700 text-white">
+            <tr>
+              <th className="text-left p-3">Product</th>
+              <th className="text-right p-3">Current Stock</th>
+              <th className="text-right p-3">7-Day Demand</th>
+              <th className="text-right p-3">Order Qty</th>
+              <th className="text-center p-3">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {report.map((r, i) => (
+              <tr key={r._id} className={`border-t ${i % 2 === 0 ? 'bg-gray-50' : ''}`}>
+                <td className="p-3 font-medium">{r.name}</td>
+                <td className="p-3 text-right">{r.currentStock} {r.unit}</td>
+                <td className="p-3 text-right text-orange-600 font-semibold">
+                  {r.predictedDemand} {r.unit}
+                </td>
+                <td className="p-3 text-right font-bold text-red-600">
+                  {r.suggestedOrder > 0 ? `${r.suggestedOrder} ${r.unit}` : '—'}
+                </td>
+                <td className="p-3 text-center">
+                  <span className={`px-3 py-1 rounded-full text-xs font-bold
+                    ${r.status === 'ORDER'
+                      ? 'bg-red-100 text-red-700'
+                      : 'bg-green-100 text-green-700'}`}>
+                    {r.status}
+                  </span>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+Add Tailwind to React
+In frontend/src/index.css replace everything with:
+css@tailwind base;
+@tailwind components;
+@tailwind utilities;
+Install Tailwind:
+bashcd frontend
+npm install -D tailwindcss postcss autoprefixer
+npx tailwindcss init -p
+In tailwind.config.js:
+jsmodule.exports = {
+  content: ["./src/**/*.{js,jsx}"],
+  theme: { extend: {} },
+  plugins: [],
+}
+
+🎉 Phase 2 Complete!
+StepWhatStatusStep 7App.jsx + Routing + Navbar✅Step 8Dashboard + Stock Cards✅Step 9Stock Alert Panel✅Step 10Sales History Chart✅Step 11Prediction Chart + Forecast Table✅Step 12Record Sale + Reorder Report✅
+Overall: 12 / 24 steps done (50%)
+
+Ready for Phase 3 — ML Enhancements? (Batch predictions, accuracy scoring, reorder logic) Just say "Phase 3"! 🚀
+
+
+
+10:50 pm
+Let's build the ML Enhancements! Steps 13–15.
+
+✅ STEP 13 — Multi-Product Batch Prediction Endpoint
+backend/routes/predictions.js (Updated — add batch route)
+js
+const router = require('express').Router();
+const axios = require('axios');
+const Sale = require('../models/Sale');
+const Product = require('../models/Product');
+require('dotenv').config();
+
+// Helper: fetch sales + call ML
+async function predictForProduct(productId, days = 7) {
+  const since = new Date();
+  since.setDate(since.getDate() - 90);
+
+  const sales = await Sale.find({
+    productId,
+    date: { $gte: since }
+  }).sort({ date: 1 });
+
+  if (sales.length < 10) return null;
+
+  const timeSeriesData = sales.map(s => ({
+    ds: s.date.toISOString().split('T')[0],
+    y: s.quantitySold
+  }));
+
+  const mlResponse = await axios.post(
+    `${process.env.ML_SERVICE_URL}/predict`,
+    { data: timeSeriesData, periods: days }
+  );
+
+  return mlResponse.data;
+}
+
+// ── Single product prediction ──────────────────────────────
+router.get('/:productId', async (req, res) => {
+  try {
+    const result = await predictForProduct(
+      req.params.productId,
+      parseInt(req.query.days) || 7
+    );
+    if (!result) {
+      return res.status(400).json({
+        error: 'Not enough data. Need at least 10 days of sales history.'
+      });
+    }
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Batch prediction for ALL products ─────────────────────
+router.get('/batch/all', async (req, res) => {
+  try {
+    const days = parseInt(req.query.days) || 7;
+    const products = await Product.find();
+
+    const results = await Promise.all(
+      products.map(async (product) => {
+        try {
+          const prediction = await predictForProduct(product._id, days);
+          if (!prediction) {
+            return {
+              productId: product._id,
+              productName: product.name,
+              unit: product.unit,
+              currentStock: product.currentStock,
+              minThreshold: product.minThreshold,
+              status: 'NO_DATA',
+              forecast: [],
+              totalPredictedDemand: 0,
+              suggestedOrderQty: 0,
+              urgency: 'UNKNOWN',
+            };
+          }
+
+          const demand = prediction.totalPredictedDemand;
+          const gap    = demand - product.currentStock;
+          const urgency =
+            product.currentStock <= product.minThreshold ? 'CRITICAL' :
+            gap > 0                                      ? 'ORDER'    :
+                                                           'SUFFICIENT';
+
+          return {
+            productId: product._id,
+            productName: product.name,
+            unit: product.unit,
+            currentStock: product.currentStock,
+            minThreshold: product.minThreshold,
+            totalPredictedDemand: demand,
+            suggestedOrderQty: Math.max(0, Math.ceil(gap)),
+            urgency,
+            forecast: prediction.forecast,
+            modelInfo: prediction.modelInfo,
+          };
+        } catch {
+          return {
+            productId: product._id,
+            productName: product.name,
+            status: 'ERROR',
+            urgency: 'UNKNOWN',
+          };
+        }
+      })
+    );
+
+    // Sort: CRITICAL → ORDER → SUFFICIENT
+    const order = { CRITICAL: 0, ORDER: 1, SUFFICIENT: 2, UNKNOWN: 3 };
+    results.sort((a, b) => (order[a.urgency] ?? 3) - (order[b.urgency] ?? 3));
+
+    res.json({
+      generatedAt: new Date().toISOString(),
+      forecastDays: days,
+      totalProducts: products.length,
+      summary: {
+        critical:   results.filter(r => r.urgency === 'CRITICAL').length,
+        order:      results.filter(r => r.urgency === 'ORDER').length,
+        sufficient: results.filter(r => r.urgency === 'SUFFICIENT').length,
+      },
+      products: results,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+module.exports = router;
+✅ STEP 14 — Reorder Suggestion Logic in Python (Enhanced)
+ml-service/app.py (Updated — add /reorder-logic + improved predict)
+python
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from prophet import Prophet
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import pandas as pd
+import numpy as np
+import math
+
+app = Flask(__name__)
+CORS(app)
+
+# ── Health Check ──────────────────────────────────────────
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"status": "ML service running ✅"})
+
+
+# ── Helper: build & train Prophet model ──────────────────
+def build_prophet_model(df):
+    model = Prophet(
+        daily_seasonality=False,
+        weekly_seasonality=True,    # kirana shops peak on weekends
+        yearly_seasonality=False,
+        changepoint_prior_scale=0.3,
+        seasonality_prior_scale=10,
+        interval_width=0.8,         # 80% confidence band
+    )
+    model.add_seasonality(name='monthly', period=30.5, fourier_order=5)
+    model.fit(df)
+    return model
+
+
+# ── Helper: compute accuracy on last 7 days (holdout) ────
+def compute_accuracy(model, df):
+    if len(df) < 17:
+        return None   # not enough data for holdout
+
+    train = df.iloc[:-7]
+    test  = df.iloc[-7:]
+
+    m = Prophet(
+        daily_seasonality=False,
+        weekly_seasonality=True,
+        yearly_seasonality=False,
+        changepoint_prior_scale=0.3,
+    )
+    m.fit(train)
+
+    future   = m.make_future_dataframe(periods=7)
+    forecast = m.predict(future)
+    preds    = forecast['yhat'].iloc[-7:].values
+    actuals  = test['y'].values
+
+    mae  = mean_absolute_error(actuals, preds)
+    rmse = math.sqrt(mean_squared_error(actuals, preds))
+    mape = np.mean(np.abs((actuals - preds) / (actuals + 1e-5))) * 100
+
+    return {
+        "mae":  round(mae, 2),
+        "rmse": round(rmse, 2),
+        "mape": round(mape, 2),
+        "accuracy_pct": round(max(0, 100 - mape), 1),
+    }
+
+
+# ── Main Predict Endpoint ─────────────────────────────────
+@app.route('/predict', methods=['POST'])
+def predict():
+    try:
+        body    = request.get_json()
+        data    = body.get('data', [])
+        periods = body.get('periods', 7)
+
+        df = pd.DataFrame(data)
+        df['ds'] = pd.to_datetime(df['ds'])
+        df['y']  = pd.to_numeric(df['y'])
+        df = df.groupby('ds', as_index=False)['y'].sum()
+        df = df.sort_values('ds').reset_index(drop=True)
+
+        # Fill missing dates with 0
+        date_range = pd.date_range(df['ds'].min(), df['ds'].max())
+        df = df.set_index('ds').reindex(date_range, fill_value=0).reset_index()
+        df.columns = ['ds', 'y']
+
+        # Accuracy (holdout test)
+        accuracy = compute_accuracy(build_prophet_model, df)
+
+        # Full model forecast
+        model    = build_prophet_model(df)
+        future   = model.make_future_dataframe(periods=periods)
+        forecast = model.predict(future)
+
+        future_only = forecast[forecast['ds'] > df['ds'].max()]
+
+        result = []
+        for _, row in future_only.iterrows():
+            result.append({
+                "date":         row['ds'].strftime('%Y-%m-%d'),
+                "predictedQty": max(0, round(row['yhat'],       2)),
+                "lower":        max(0, round(row['yhat_lower'], 2)),
+                "upper":        max(0, round(row['yhat_upper'], 2)),
+            })
+
+        total_demand = sum(r['predictedQty'] for r in result)
+
+        # Trend detection
+        recent_avg = df['y'].iloc[-7:].mean()
+        older_avg  = df['y'].iloc[-30:-7].mean() if len(df) > 30 else recent_avg
+        trend = (
+            'RISING'  if recent_avg > older_avg * 1.1  else
+            'FALLING' if recent_avg < older_avg * 0.9  else
+            'STABLE'
+        )
+
+        return jsonify({
+            "forecast":              result,
+            "totalPredictedDemand": round(total_demand, 2),
+            "forecastDays":          periods,
+            "trend":                 trend,
+            "accuracy":              accuracy,
+            "modelInfo": {
+                "dataPointsUsed": len(df),
+                "algorithm":      "Facebook Prophet (Time-Series)",
+                "avgDailySales":  round(df['y'].mean(), 2),
+            }
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ── Reorder Suggestion Logic ──────────────────────────────
+@app.route('/reorder-logic', methods=['POST'])
+def reorder_logic():
+    """
+    Input:  { products: [{ productId, currentStock, minThreshold, unit,
+                           salesData: [{ds, y}] }],
+              forecastDays: 7 }
+    Output: reorder suggestions with urgency levels
+    """
+    try:
+        body          = request.get_json()
+        products      = body.get('products', [])
+        forecast_days = body.get('forecastDays', 7)
+        results       = []
+
+        for product in products:
+            sales_data = product.get('salesData', [])
+            if len(sales_data) < 10:
+                results.append({
+                    **product,
+                    "status":           "INSUFFICIENT_DATA",
+                    "suggestedOrderQty": 0,
+                    "urgency":          "UNKNOWN",
+                })
+                continue
+
+            df = pd.DataFrame(sales_data)
+            df['ds'] = pd.to_datetime(df['ds'])
+            df['y']  = pd.to_numeric(df['y'])
+            df = df.groupby('ds', as_index=False)['y'].sum()
+
+            # Fill missing dates
+            date_range = pd.date_range(df['ds'].min(), df['ds'].max())
+            df = df.set_index('ds').reindex(date_range, fill_value=0).reset_index()
+            df.columns = ['ds', 'y']
+
+            model    = build_prophet_model(df)
+            future   = model.make_future_dataframe(periods=forecast_days)
+            forecast = model.predict(future)
+
+            future_only  = forecast[forecast['ds'] > df['ds'].max()]
+            total_demand = max(0, round(future_only['yhat'].sum(), 2))
+
+            current_stock  = product.get('currentStock', 0)
+            min_threshold  = product.get('minThreshold', 0)
+            gap            = total_demand - current_stock
+            suggested_qty  = max(0, math.ceil(gap + min_threshold))  # include buffer
+
+            # Urgency classification
+            days_of_stock = (
+                (current_stock / (total_demand / forecast_days))
+                if total_demand > 0 else 999
+            )
+
+            urgency = (
+                'CRITICAL'   if days_of_stock <= 2              else
+                'HIGH'       if days_of_stock <= forecast_days / 2 else
+                'ORDER'      if gap > 0                          else
+                'SUFFICIENT'
+            )
+
+            results.append({
+                "productId":          product.get('productId'),
+                "productName":        product.get('productName'),
+                "unit":               product.get('unit', ''),
+                "currentStock":       current_stock,
+                "totalPredictedDemand": total_demand,
+                "suggestedOrderQty":  suggested_qty,
+                "daysOfStockLeft":    round(days_of_stock, 1),
+                "urgency":            urgency,
+            })
+
+        # Sort by urgency
+        urgency_order = {'CRITICAL': 0, 'HIGH': 1, 'ORDER': 2,
+                         'SUFFICIENT': 3, 'UNKNOWN': 4}
+        results.sort(key=lambda x: urgency_order.get(x['urgency'], 4))
+
+        return jsonify({
+            "suggestions":   results,
+            "forecastDays":  forecast_days,
+            "generatedAt":   pd.Timestamp.now().isoformat(),
+            "summary": {
+                "critical":   sum(1 for r in results if r['urgency'] == 'CRITICAL'),
+                "high":       sum(1 for r in results if r['urgency'] == 'HIGH'),
+                "order":      sum(1 for r in results if r['urgency'] == 'ORDER'),
+                "sufficient": sum(1 for r in results if r['urgency'] == 'SUFFICIENT'),
+            }
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+if __name__ == '__main__':
+    app.run(port=8000, debug=True)
+✅ STEP 15 — Accuracy Scoring UI (MAE / RMSE / MAPE)
+frontend/src/api/index.js (add batch call)
+js
+import axios from 'axios';
+
+const API = axios.create({ baseURL: 'http://localhost:5000/api' });
+
+export const getProducts      = ()          => API.get('/products');
+export const updateStock      = (id, qty)   => API.put(`/products/${id}/stock`, { currentStock: qty });
+export const getSales         = (id, days)  => API.get(`/sales/${id}?days=${days}`);
+export const getPrediction    = (id, days)  => API.get(`/predictions/${id}?days=${days}`);
+export const getBatchPredict  = (days = 7)  => API.get(`/predictions/batch/all?days=${days}`);
+export const recordSale       = (data)      => API.post('/sales', data);
+export const createProduct    = (data)      => API.post('/products', data);
+frontend/src/components/AccuracyBadge.jsx
+jsx
+export default function AccuracyBadge({ accuracy }) {
+  if (!accuracy) return null;
+
+  const pct = accuracy.accuracy_pct;
+  const color =
+    pct >= 85 ? 'green' :
+    pct >= 70 ? 'yellow' :
+                'red';
+
+  const colorMap = {
+    green:  'bg-green-100 text-green-700 border-green-300',
+    yellow: 'bg-yellow-100 text-yellow-700 border-yellow-300',
+    red:    'bg-red-100 text-red-700 border-red-300',
+  };
+
+  return (
+    <div className={`rounded-xl border p-4 ${colorMap[color]}`}>
+      <h4 className="font-bold text-sm mb-2">🎯 Model Accuracy (7-day holdout test)</h4>
+      <div className="grid grid-cols-4 gap-3 text-center">
+        <div>
+          <p className="text-2xl font-bold">{pct}%</p>
+          <p className="text-xs">Accuracy</p>
+        </div>
+        <div>
+          <p className="text-2xl font-bold">{accuracy.mae}</p>
+          <p className="text-xs">MAE</p>
+        </div>
+        <div>
+          <p className="text-2xl font-bold">{accuracy.rmse}</p>
+          <p className="text-xs">RMSE</p>
+        </div>
+        <div>
+          <p className="text-2xl font-bold">{accuracy.mape}%</p>
+          <p className="text-xs">MAPE</p>
+        </div>
+      </div>
+      <div className="mt-3 w-full bg-gray-200 rounded-full h-2">
+        <div
+          className={`h-2 rounded-full ${
+            color === 'green'  ? 'bg-green-500'  :
+            color === 'yellow' ? 'bg-yellow-500' :
+                                  'bg-red-500'
+          }`}
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+    </div>
+  );
+}
+frontend/src/components/TrendBadge.jsx
+jsx
+export default function TrendBadge({ trend }) {
+  if (!trend) return null;
+
+  const map = {
+    RISING:  { icon: '📈', label: 'Demand Rising',  cls: 'bg-red-100 text-red-700' },
+    FALLING: { icon: '📉', label: 'Demand Falling', cls: 'bg-blue-100 text-blue-700' },
+    STABLE:  { icon: '➡️', label: 'Demand Stable',  cls: 'bg-gray-100 text-gray-700' },
+  };
+
+  const { icon, label, cls } = map[trend] || map.STABLE;
+
+  return (
+    <span className={`inline-flex items-center gap-1 px-3 py-1 rounded-full text-sm font-semibold ${cls}`}>
+      {icon} {label}
+    </span>
+  );
+}
+Update frontend/src/pages/Predictions.jsx — add accuracy + trend
+jsx
+// Add these imports at top:
+import AccuracyBadge from '../components/AccuracyBadge';
+import TrendBadge from '../components/TrendBadge';
+
+// Inside the JSX, after the summary cards grid, add:
+{forecast && (
+  <div className="flex items-center gap-3 mb-4">
+    <TrendBadge trend={forecast.trend} />
+    <span className="text-sm text-gray-500">
+      Avg daily sales: <strong>{forecast.modelInfo?.avgDailySales} {selected?.unit}</strong>
+    </span>
+  </div>
+)}
+
+// After the PredictionChart, add:
+{forecast?.accuracy && (
+  <div className="mt-6">
+    <AccuracyBadge accuracy={forecast.accuracy} />
+  </div>
+)}
+New Batch Dashboard Page — frontend/src/pages/BatchPredictions.jsx
+jsx
+import { useEffect, useState } from 'react';
+import { getBatchPredict } from '../api';
+
+const urgencyStyle = {
+  CRITICAL:   'bg-red-100 text-red-700 border-red-300',
+  HIGH:       'bg-orange-100 text-orange-700 border-orange-300',
+  ORDER:      'bg-yellow-100 text-yellow-700 border-yellow-300',
+  SUFFICIENT: 'bg-green-100 text-green-700 border-green-300',
+  UNKNOWN:    'bg-gray-100 text-gray-500 border-gray-200',
+};
+
+const urgencyIcon = {
+  CRITICAL:   '🔴',
+  HIGH:       '🟠',
+  ORDER:      '🟡',
+  SUFFICIENT: '🟢',
+  UNKNOWN:    '⚪',
+};
+
+export default function BatchPredictions() {
+  const [data, setData]     = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [days, setDays]     = useState(7);
+
+  const load = (d) => {
+    setLoading(true);
+    getBatchPredict(d)
+      .then(res => setData(res.data))
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(() => { load(days); }, []);
+
+  return (
+    <div>
+      <div className="flex justify-between items-center mb-6">
+        <h1 className="text-2xl font-bold text-gray-800">
+          📦 Batch Prediction Report
+        </h1>
+        <div className="flex gap-2 items-center">
+          <select
+            className="border rounded-lg px-3 py-2 text-sm"
+            value={days}
+            onChange={e => { setDays(+e.target.value); load(+e.target.value); }}>
+            <option value={7}>Next 7 days</option>
+            <option value={14}>Next 14 days</option>
+            <option value={30}>Next 30 days</option>
+          </select>
+          <button
+            onClick={() => load(days)}
+            className="bg-green-700 text-white px-4 py-2 text-sm rounded-lg hover:bg-green-800">
+            Refresh
+          </button>
+        </div>
+      </div>
+
+      {loading ? (
+        <div className="text-center py-20 text-gray-500">
+          Running ML forecasts for all products...
+        </div>
+      ) : data && (
+        <>
+          {/* Summary */}
+          <div className="grid grid-cols-4 gap-4 mb-6">
+            {[
+              { label: 'Critical',   key: 'critical',   color: 'text-red-600'    },
+              { label: 'High',       key: 'high',       color: 'text-orange-600' },
+              { label: 'Order',      key: 'order',      color: 'text-yellow-600' },
+              { label: 'Sufficient', key: 'sufficient', color: 'text-green-600'  },
+            ].map(({ label, key, color }) => (
+              <div key={key} className="bg-white rounded-xl p-4 shadow text-center">
+                <p className={`text-3xl font-bold ${color}`}>{data.summary[key]}</p>
+                <p className="text-sm text-gray-500 mt-1">{label}</p>
+              </div>
+            ))}
+          </div>
+
+          {/* Timestamp */}
+          <p className="text-xs text-gray-400 mb-3">
+            Generated: {new Date(data.generatedAt).toLocaleString()} ·
+            Forecast window: {data.forecastDays} days
+          </p>
+
+          {/* Product Cards */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {data.products.map(p => (
+              <div key={p.productId}
+                className={`rounded-xl border p-4 shadow-sm ${urgencyStyle[p.urgency]}`}>
+                <div className="flex justify-between items-start mb-2">
+                  <h3 className="font-bold text-lg">{p.productName}</h3>
+                  <span className="text-xl">{urgencyIcon[p.urgency]}</span>
+                </div>
+                <div className="grid grid-cols-2 gap-2 text-sm">
+                  <div>
+                    <p className="opacity-60">Current Stock</p>
+                    <p className="font-semibold">{p.currentStock} {p.unit}</p>
+                  </div>
+                  <div>
+                    <p className="opacity-60">{data.forecastDays}-Day Demand</p>
+                    <p className="font-semibold">{p.totalPredictedDemand} {p.unit}</p>
+                  </div>
+                  <div>
+                    <p className="opacity-60">Order Qty</p>
+                    <p className="font-bold text-base">
+                      {p.suggestedOrderQty > 0 ? `${p.suggestedOrderQty} ${p.unit}` : '—'}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="opacity-60">Urgency</p>
+                    <p className="font-bold">{p.urgency}</p>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+Add Batch route to App.jsx
+jsx
+// Add import:
+import BatchPredictions from './pages/BatchPredictions';
+
+// Add route:
+<Route path="/batch" element={<BatchPredictions />} />
+Add to Navbar.jsx
+jsx
+// Add to links array:
+{ to: '/batch', label: 'Batch Report', icon: BarChart2 },
+🎉 Phase 3 Complete!
+Step	What	Status
+Step 13	Batch prediction endpoint (all products)	✅
+Step 14	Reorder logic (CRITICAL / HIGH / ORDER / SUFFICIENT)	✅
+Step 15	Accuracy scoring (MAE, RMSE, MAPE + trend detection)	✅
+Full Progress
+Phase	Steps	Status
+Phase 1 — Backend + ML	6/6	✅ Done
+Phase 2 — React Frontend	6/6	✅ Done
+Phase 3 — ML Enhancements	3/3	✅ Done
+Phase 4 — Business Features	0/3	🔲 Next
+Phase 5 — Polish & UX	0/3	🔲 Pending
+Phase 6 — Deployment	0/3	🔲 Pending
+Overall: 15 / 24 steps done (62%)
+
+Ready for Phase 4 — Business Features? (Daily sales form, reorder report, category summary) Just say "Phase 4"! 🚀
+
+Let's build the Business Features! Steps 16–18.
+
+✅ STEP 16 — Record Daily Sales Form (Enhanced UI)
+backend/routes/sales.js (Updated — add bulk + summary routes)
+jsconst router = require('express').Router();
+const Sale = require('../models/Sale');
+const Product = require('../models/Product');
+
+// ── GET sales for a product ───────────────────────────────
+router.get('/:productId', async (req, res) => {
+  try {
+    const days  = parseInt(req.query.days) || 90;
+    const since = new Date();
+    since.setDate(since.getDate() - days);
+
+    const sales = await Sale.find({
+      productId: req.params.productId,
+      date: { $gte: since }
+    }).sort({ date: 1 });
+
+    res.json(sales);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── GET daily summary across all products ─────────────────
+router.get('/summary/daily', async (req, res) => {
+  try {
+    const days  = parseInt(req.query.days) || 30;
+    const since = new Date();
+    since.setDate(since.getDate() - days);
+
+    const summary = await Sale.aggregate([
+      { $match: { date: { $gte: since } } },
+      {
+        $group: {
+          _id: {
+            date:     { $dateToString: { format: '%Y-%m-%d', date: '$date' } },
+            category: '$productName',
+          },
+          totalQty:     { $sum: '$quantitySold' },
+          totalRevenue: { $sum: '$revenue' },
+        }
+      },
+      { $sort: { '_id.date': 1 } }
+    ]);
+
+    res.json(summary);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── GET category-wise summary ─────────────────────────────
+router.get('/summary/category', async (req, res) => {
+  try {
+    const days  = parseInt(req.query.days) || 30;
+    const since = new Date();
+    since.setDate(since.getDate() - days);
+
+    // Join with products to get category
+    const summary = await Sale.aggregate([
+      { $match: { date: { $gte: since } } },
+      {
+        $lookup: {
+          from:         'products',
+          localField:   'productId',
+          foreignField: '_id',
+          as:           'product'
+        }
+      },
+      { $unwind: '$product' },
+      {
+        $group: {
+          _id:          '$product.category',
+          totalQty:     { $sum: '$quantitySold' },
+          totalRevenue: { $sum: '$revenue' },
+          topProduct: { $first: '$productName' },
+          salesCount:   { $sum: 1 },
+        }
+      },
+      { $sort: { totalRevenue: -1 } }
+    ]);
+
+    res.json(summary);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── POST record single sale + update stock ────────────────
+router.post('/', async (req, res) => {
+  try {
+    const { productId, productName, date, quantitySold, revenue } = req.body;
+
+    const sale = await Sale.create({
+      productId, productName,
+      date: new Date(date),
+      quantitySold,
+      revenue: revenue || 0,
+    });
+
+    // Deduct from current stock
+    await Product.findByIdAndUpdate(productId, {
+      $inc: { currentStock: -quantitySold }
+    });
+
+    res.status(201).json(sale);
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ── POST bulk record multiple sales at once ───────────────
+router.post('/bulk', async (req, res) => {
+  try {
+    const { sales } = req.body; // array of sale objects
+
+    const created = await Sale.insertMany(
+      sales.map(s => ({
+        ...s,
+        date: new Date(s.date),
+      }))
+    );
+
+    // Update stock for each product
+    for (const sale of sales) {
+      await Product.findByIdAndUpdate(sale.productId, {
+        $inc: { currentStock: -sale.quantitySold }
+      });
+    }
+
+    res.status(201).json({
+      message: `${created.length} sales recorded`,
+      sales: created
+    });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+module.exports = router;
+Update frontend/src/api/index.js — add new endpoints
+jsimport axios from 'axios';
+
+const API = axios.create({ baseURL: 'http://localhost:5000/api' });
+
+export const getProducts        = ()         => API.get('/products');
+export const createProduct      = (data)     => API.post('/products', data);
+export const updateStock        = (id, qty)  => API.put(`/products/${id}/stock`, { currentStock: qty });
+
+export const getSales           = (id, days) => API.get(`/sales/${id}?days=${days}`);
+export const recordSale         = (data)     => API.post('/sales', data);
+export const recordBulkSales    = (sales)    => API.post('/sales/bulk', { sales });
+export const getDailySummary    = (days)     => API.get(`/sales/summary/daily?days=${days}`);
+export const getCategorySummary = (days)     => API.get(`/sales/summary/category?days=${days}`);
+
+export const getPrediction      = (id, days) => API.get(`/predictions/${id}?days=${days}`);
+export const getBatchPredict    = (days = 7) => API.get(`/predictions/batch/all?days=${days}`);
+frontend/src/pages/RecordSale.jsx (Full Enhanced Version)
+jsximport { useEffect, useState } from 'react';
+import { getProducts, recordSale, recordBulkSales } from '../api';
+import { PlusCircle, Trash2, CheckCircle } from 'lucide-react';
+
+const emptyRow = (products) => ({
+  productId:    products[0]?._id || '',
+  productName:  products[0]?.name || '',
+  quantitySold: '',
+  revenue:      '',
+});
+
+export default function RecordSale() {
+  const [products, setProducts] = useState([]);
+  const [mode, setMode]         = useState('single');  // single | bulk
+  const [date, setDate]         = useState(new Date().toISOString().split('T')[0]);
+  const [rows, setRows]         = useState([]);
+  const [msg, setMsg]           = useState('');
+  const [error, setError]       = useState('');
+  const [loading, setLoading]   = useState(false);
+
+  useEffect(() => {
+    getProducts().then(res => {
+      setProducts(res.data);
+      setRows([emptyRow(res.data)]);
+    });
+  }, []);
+
+  const addRow = () => setRows(r => [...r, emptyRow(products)]);
+
+  const removeRow = (i) => setRows(r => r.filter((_, idx) => idx !== i));
+
+  const updateRow = (i, field, value) => {
+    setRows(r => r.map((row, idx) => {
+      if (idx !== i) return row;
+      const updated = { ...row, [field]: value };
+      if (field === 'productId') {
+        const p = products.find(p => p._id === value);
+        updated.productName = p?.name || '';
+      }
+      return updated;
+    }));
+  };
+
+  const handleSubmit = async () => {
+    setError(''); setMsg(''); setLoading(true);
+    try {
+      const validRows = rows.filter(r => r.productId && r.quantitySold > 0);
+      if (!validRows.length) {
+        setError('Please fill in at least one sale entry.'); return;
+      }
+
+      const payload = validRows.map(r => ({
+        productId:    r.productId,
+        productName:  r.productName,
+        date,
+        quantitySold: parseFloat(r.quantitySold),
+        revenue:      parseFloat(r.revenue) || 0,
+      }));
+
+      if (mode === 'single') {
+        await recordSale(payload[0]);
+      } else {
+        await recordBulkSales(payload);
+      }
+
+      setMsg(`✅ ${payload.length} sale(s) recorded for ${date}!`);
+      setRows([emptyRow(products)]);
+      setTimeout(() => setMsg(''), 4000);
+    } catch (err) {
+      setError(err.response?.data?.error || 'Failed to record sale');
+    } finally { setLoading(false); }
+  };
+
+  return (
+    <div className="max-w-3xl mx-auto">
+      <h1 className="text-2xl font-bold text-gray-800 mb-6">🧾 Record Daily Sales</h1>
+
+      {/* Mode Toggle */}
+      <div className="flex gap-2 mb-6">
+        {['single', 'bulk'].map(m => (
+          <button key={m}
+            onClick={() => { setMode(m); setRows([emptyRow(products)]); }}
+            className={`px-4 py-2 rounded-lg text-sm font-medium transition
+              ${mode === m
+                ? 'bg-green-700 text-white'
+                : 'bg-white text-gray-600 border hover:bg-gray-50'}`}>
+            {m === 'single' ? '📝 Single Entry' : '📋 Bulk Entry'}
+          </button>
+        ))}
+      </div>
+
+      <div className="bg-white rounded-xl p-6 shadow">
+        {/* Date Picker */}
+        <div className="mb-5">
+          <label className="text-sm font-medium text-gray-600 block mb-1">Sale Date</label>
+          <input type="date"
+            className="border rounded-lg px-3 py-2 text-sm w-full sm:w-48"
+            value={date}
+            onChange={e => setDate(e.target.value)} />
+        </div>
+
+        {/* Sale Rows */}
+        <div className="space-y-3">
+          {rows.map((row, i) => (
+            <div key={i} className="grid grid-cols-12 gap-2 items-center
+              bg-gray-50 rounded-lg p-3">
+
+              {/* Product */}
+              <div className={mode === 'bulk' ? 'col-span-5' : 'col-span-6'}>
+                <label className="text-xs text-gray-500 mb-1 block">Product</label>
+                <select
+                  className="w-full border rounded-lg px-2 py-2 text-sm"
+                  value={row.productId}
+                  onChange={e => updateRow(i, 'productId', e.target.value)}>
+                  {products.map(p => (
+                    <option key={p._id} value={p._id}>{p.name}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Quantity */}
+              <div className="col-span-3">
+                <label className="text-xs text-gray-500 mb-1 block">Qty Sold</label>
+                <input type="number" min="0" step="0.5"
+                  placeholder="e.g. 5"
+                  className="w-full border rounded-lg px-2 py-2 text-sm"
+                  value={row.quantitySold}
+                  onChange={e => updateRow(i, 'quantitySold', e.target.value)} />
+              </div>
+
+              {/* Revenue */}
+              <div className="col-span-3">
+                <label className="text-xs text-gray-500 mb-1 block">Revenue (₹)</label>
+                <input type="number" min="0"
+                  placeholder="e.g. 250"
+                  className="w-full border rounded-lg px-2 py-2 text-sm"
+                  value={row.revenue}
+                  onChange={e => updateRow(i, 'revenue', e.target.value)} />
+              </div>
+
+              {/* Remove (bulk only) */}
+              {mode === 'bulk' && (
+                <div className="col-span-1 flex items-end pb-1">
+                  <button onClick={() => removeRow(i)}
+                    className="text-red-400 hover:text-red-600 mt-5">
+                    <Trash2 size={16} />
+                  </button>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+
+        {/* Add Row (bulk mode) */}
+        {mode === 'bulk' && (
+          <button onClick={addRow}
+            className="mt-3 flex items-center gap-2 text-sm text-green-700
+              hover:text-green-900 font-medium">
+            <PlusCircle size={16} /> Add Another Product
+          </button>
+        )}
+
+        {/* Feedback */}
+        {msg   && <p className="mt-4 text-green-600 font-medium flex items-center gap-2">
+          <CheckCircle size={16} /> {msg}</p>}
+        {error && <p className="mt-4 text-red-600 text-sm">{error}</p>}
+
+        {/* Submit */}
+        <button onClick={handleSubmit} disabled={loading}
+          className="mt-5 w-full bg-green-700 text-white py-3 rounded-lg
+            font-semibold hover:bg-green-800 disabled:opacity-50 transition">
+          {loading ? 'Recording...' : `Record ${rows.length > 1 ? rows.length + ' Sales' : 'Sale'}`}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+✅ STEP 17 — Reorder Report Page (Enhanced)
+frontend/src/pages/ReorderReport.jsx (Full Rewrite)
+jsximport { useEffect, useState } from 'react';
+import { getProducts, getPrediction } from '../api';
+import { Download, RefreshCw } from 'lucide-react';
+
+const urgencyConfig = {
+  CRITICAL:   { bg: 'bg-red-50',    badge: 'bg-red-100 text-red-700',    icon: '🔴', label: 'Critical'   },
+  HIGH:       { bg: 'bg-orange-50', badge: 'bg-orange-100 text-orange-700', icon: '🟠', label: 'High'    },
+  ORDER:      { bg: 'bg-yellow-50', badge: 'bg-yellow-100 text-yellow-700', icon: '🟡', label: 'Order'   },
+  SUFFICIENT: { bg: 'bg-green-50',  badge: 'bg-green-100 text-green-700', icon: '🟢', label: 'OK'        },
+  NO_DATA:    { bg: 'bg-gray-50',   badge: 'bg-gray-100 text-gray-500',   icon: '⚪', label: 'No Data'   },
+};
+
+export default function ReorderReport() {
+  const [report, setReport]   = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [days, setDays]       = useState(7);
+  const [filter, setFilter]   = useState('ALL');
+
+  const load = async (d) => {
+    setLoading(true);
+    try {
+      const res = await getProducts();
+      const rows = await Promise.all(res.data.map(async p => {
+        try {
+          const pred    = await getPrediction(p._id, d);
+          const demand  = pred.data.totalPredictedDemand;
+          const gap     = demand - p.currentStock;
+          const daysLeft = demand > 0
+            ? (p.currentStock / (demand / d)).toFixed(1)
+            : '∞';
+
+          const urgency =
+            parseFloat(daysLeft) <= 1     ? 'CRITICAL' :
+            parseFloat(daysLeft) <= d / 2 ? 'HIGH'     :
+            gap > 0                        ? 'ORDER'    :
+                                             'SUFFICIENT';
+
+          return {
+            ...p,
+            predictedDemand:  demand,
+            suggestedOrder:   Math.max(0, Math.ceil(gap + p.minThreshold)),
+            daysLeft,
+            urgency,
+            trend: pred.data.trend,
+          };
+        } catch {
+          return { ...p, urgency: 'NO_DATA', predictedDemand: 0,
+                   suggestedOrder: 0, daysLeft: '—' };
+        }
+      }));
+
+      const order = { CRITICAL: 0, HIGH: 1, ORDER: 2, SUFFICIENT: 3, NO_DATA: 4 };
+      rows.sort((a, b) => (order[a.urgency] ?? 4) - (order[b.urgency] ?? 4));
+      setReport(rows);
+    } finally { setLoading(false); }
+  };
+
+  useEffect(() => { load(days); }, []);
+
+  const filtered = filter === 'ALL'
+    ? report
+    : report.filter(r => r.urgency === filter);
+
+  // CSV export
+  const exportCSV = () => {
+    const headers = ['Product', 'Category', 'Current Stock', 'Unit',
+                     `${days}-Day Demand`, 'Suggested Order', 'Days Left', 'Urgency'];
+    const rows = report.map(r => [
+      r.name, r.category, r.currentStock, r.unit,
+      r.predictedDemand, r.suggestedOrder, r.daysLeft, r.urgency
+    ]);
+    const csv = [headers, ...rows].map(r => r.join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url; a.download = `reorder-report-${days}days.csv`; a.click();
+  };
+
+  const summary = {
+    critical:   report.filter(r => r.urgency === 'CRITICAL').length,
+    high:       report.filter(r => r.urgency === 'HIGH').length,
+    order:      report.filter(r => r.urgency === 'ORDER').length,
+    sufficient: report.filter(r => r.urgency === 'SUFFICIENT').length,
+  };
+
+  return (
+    <div>
+      {/* Header */}
+      <div className="flex flex-wrap justify-between items-center gap-3 mb-6">
+        <h1 className="text-2xl font-bold text-gray-800">🛒 Reorder Report</h1>
+        <div className="flex gap-2 flex-wrap">
+          <select className="border rounded-lg px-3 py-2 text-sm"
+            value={days}
+            onChange={e => { setDays(+e.target.value); load(+e.target.value); }}>
+            <option value={7}>7-day forecast</option>
+            <option value={14}>14-day forecast</option>
+            <option value={30}>30-day forecast</option>
+          </select>
+          <button onClick={() => load(days)}
+            className="flex items-center gap-1 border px-3 py-2 rounded-lg text-sm
+              hover:bg-gray-50">
+            <RefreshCw size={14} /> Refresh
+          </button>
+          <button onClick={exportCSV}
+            className="flex items-center gap-1 bg-green-700 text-white px-3 py-2
+              rounded-lg text-sm hover:bg-green-800">
+            <Download size={14} /> Export CSV
+          </button>
+        </div>
+      </div>
+
+      {/* Summary Tiles */}
+      <div className="grid grid-cols-4 gap-3 mb-6">
+        {[
+          { key: 'critical',   label: 'Critical',   color: 'text-red-600'    },
+          { key: 'high',       label: 'High',       color: 'text-orange-600' },
+          { key: 'order',      label: 'To Order',   color: 'text-yellow-600' },
+          { key: 'sufficient', label: 'Sufficient', color: 'text-green-600'  },
+        ].map(({ key, label, color }) => (
+          <div key={key} className="bg-white rounded-xl p-4 shadow text-center
+            cursor-pointer hover:shadow-md transition"
+            onClick={() => setFilter(filter === key.toUpperCase() ? 'ALL' : key.toUpperCase())}>
+            <p className={`text-3xl font-bold ${color}`}>{summary[key]}</p>
+            <p className="text-xs text-gray-500 mt-1">{label}</p>
+          </div>
+        ))}
+      </div>
+
+      {/* Filter Bar */}
+      <div className="flex gap-2 mb-4 flex-wrap">
+        {['ALL', 'CRITICAL', 'HIGH', 'ORDER', 'SUFFICIENT'].map(f => (
+          <button key={f}
+            onClick={() => setFilter(f)}
+            className={`px-3 py-1 rounded-full text-xs font-semibold transition
+              ${filter === f
+                ? 'bg-green-700 text-white'
+                : 'bg-white border text-gray-600 hover:bg-gray-50'}`}>
+            {f}
+          </button>
+        ))}
+      </div>
+
+      {/* Table */}
+      {loading ? (
+        <div className="text-center py-20 text-gray-500">
+          Calculating predictions...
+        </div>
+      ) : (
+        <div className="bg-white rounded-xl shadow overflow-hidden">
+          <table className="w-full text-sm">
+            <thead className="bg-green-700 text-white">
+              <tr>
+                <th className="text-left p-3">Product</th>
+                <th className="text-left p-3">Category</th>
+                <th className="text-right p-3">Stock</th>
+                <th className="text-right p-3">{days}d Demand</th>
+                <th className="text-right p-3">Days Left</th>
+                <th className="text-right p-3">Order Qty</th>
+                <th className="text-center p-3">Trend</th>
+                <th className="text-center p-3">Urgency</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((r, i) => {
+                const cfg = urgencyConfig[r.urgency] || urgencyConfig.NO_DATA;
+                return (
+                  <tr key={r._id}
+                    className={`border-t ${i % 2 === 0 ? cfg.bg : ''}`}>
+                    <td className="p-3 font-semibold">{r.name}</td>
+                    <td className="p-3 text-gray-500">{r.category}</td>
+                    <td className="p-3 text-right">
+                      {r.currentStock} {r.unit}
+                    </td>
+                    <td className="p-3 text-right font-semibold text-orange-600">
+                      {r.predictedDemand} {r.unit}
+                    </td>
+                    <td className={`p-3 text-right font-bold
+                      ${parseFloat(r.daysLeft) <= 2 ? 'text-red-600' :
+                        parseFloat(r.daysLeft) <= 4 ? 'text-orange-600' :
+                        'text-gray-600'}`}>
+                      {r.daysLeft}d
+                    </td>
+                    <td className="p-3 text-right font-bold text-gray-800">
+                      {r.suggestedOrder > 0
+                        ? `${r.suggestedOrder} ${r.unit}`
+                        : <span className="text-green-600 font-normal">—</span>}
+                    </td>
+                    <td className="p-3 text-center text-base">
+                      {r.trend === 'RISING'  ? '📈' :
+                       r.trend === 'FALLING' ? '📉' : '➡️'}
+                    </td>
+                    <td className="p-3 text-center">
+                      <span className={`px-2 py-1 rounded-full text-xs font-bold ${cfg.badge}`}>
+                        {cfg.icon} {cfg.label}
+                      </span>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+          {filtered.length === 0 && (
+            <div className="text-center py-12 text-gray-400">
+              No products match this filter.
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+✅ STEP 18 — Category-Wise Demand Summary
+frontend/src/pages/CategorySummary.jsx
+jsximport { useEffect, useState } from 'react';
+import { getCategorySummary, getDailySummary } from '../api';
+import {
+  BarChart, Bar, XAxis, YAxis, CartesianGrid,
+  Tooltip, Legend, ResponsiveContainer,
+  PieChart, Pie, Cell, LineChart, Line
+} from 'recharts';
+
+const COLORS = ['#16a34a','#f97316','#3b82f6','#a855f7','#ec4899','#eab308'];
+
+export default function CategorySummary() {
+  const [categories, setCategories] = useState([]);
+  const [dailyData,  setDailyData]  = useState([]);
+  const [days, setDays]             = useState(30);
+  const [loading, setLoading]       = useState(true);
+
+  useEffect(() => {
+    setLoading(true);
+    Promise.all([
+      getCategorySummary(days),
+      getDailySummary(days),
+    ]).then(([catRes, dailyRes]) => {
+      setCategories(catRes.data);
+
+      // Aggregate daily revenue across all products
+      const map = {};
+      dailyRes.data.forEach(({ _id, totalRevenue }) => {
+        const date = _id.date;
+        map[date]  = (map[date] || 0) + totalRevenue;
+      });
+      const sorted = Object.entries(map)
+        .map(([date, revenue]) => ({ date: date.slice(5), revenue: +revenue.toFixed(2) }))
+        .sort((a, b) => a.date.localeCompare(b.date));
+
+      setDailyData(sorted);
+    }).finally(() => setLoading(false));
+  }, [days]);
+
+  const totalRevenue = categories.reduce((s, c) => s + c.totalRevenue, 0);
+  const totalQty     = categories.reduce((s, c) => s + c.totalQty, 0);
+
+  const pieData = categories.map(c => ({
+    name:  c._id,
+    value: +c.totalRevenue.toFixed(2),
+  }));
+
+  const barData = categories.map(c => ({
+    category:    c._id,
+    quantity:    +c.totalQty.toFixed(2),
+    revenue:     +c.totalRevenue.toFixed(2),
+    salesCount:  c.salesCount,
+  }));
+
+  if (loading) return (
+    <div className="text-center py-20 text-gray-500">Loading category data...</div>
+  );
+
+  return (
+    <div>
+      {/* Header */}
+      <div className="flex justify-between items-center mb-6">
+        <h1 className="text-2xl font-bold text-gray-800">📊 Category Summary</h1>
+        <select className="border rounded-lg px-3 py-2 text-sm"
+          value={days}
+          onChange={e => setDays(+e.target.value)}>
+          <option value={7}>Last 7 days</option>
+          <option value={30}>Last 30 days</option>
+          <option value={90}>Last 90 days</option>
+        </select>
+      </div>
+
+      {/* KPI Cards */}
+      <div className="grid grid-cols-3 gap-4 mb-8">
+        <div className="bg-white rounded-xl p-4 shadow text-center">
+          <p className="text-xs text-gray-500 mb-1">Total Revenue</p>
+          <p className="text-2xl font-bold text-green-700">
+            ₹{totalRevenue.toLocaleString('en-IN', { maximumFractionDigits: 0 })}
+          </p>
+        </div>
+        <div className="bg-white rounded-xl p-4 shadow text-center">
+          <p className="text-xs text-gray-500 mb-1">Total Qty Sold</p>
+          <p className="text-2xl font-bold text-blue-600">
+            {totalQty.toFixed(1)} units
+          </p>
+        </div>
+        <div className="bg-white rounded-xl p-4 shadow text-center">
+          <p className="text-xs text-gray-500 mb-1">Categories</p>
+          <p className="text-2xl font-bold text-purple-600">{categories.length}</p>
+        </div>
+      </div>
+
+      {/* Charts Row */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+
+        {/* Revenue by Category - Bar */}
+        <div className="bg-white rounded-xl p-4 shadow">
+          <h3 className="font-semibold text-gray-700 mb-4">
+            💰 Revenue by Category
+          </h3>
+          <ResponsiveContainer width="100%" height={250}>
+            <BarChart data={barData}>
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis dataKey="category" tick={{ fontSize: 11 }} />
+              <YAxis tick={{ fontSize: 11 }} />
+              <Tooltip formatter={(v) => `₹${v}`} />
+              <Bar dataKey="revenue" fill="#16a34a" radius={[4,4,0,0]} name="Revenue (₹)" />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+
+        {/* Revenue Share - Pie */}
+        <div className="bg-white rounded-xl p-4 shadow">
+          <h3 className="font-semibold text-gray-700 mb-4">
+            🥧 Revenue Share
+          </h3>
+          <ResponsiveContainer width="100%" height={250}>
+            <PieChart>
+              <Pie data={pieData} cx="50%" cy="50%"
+                outerRadius={90} dataKey="value"
+                label={({ name, percent }) =>
+                  `${name} ${(percent * 100).toFixed(0)}%`}>
+                {pieData.map((_, i) => (
+                  <Cell key={i} fill={COLORS[i % COLORS.length]} />
+                ))}
+              </Pie>
+              <Tooltip formatter={(v) => `₹${v}`} />
+            </PieChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+
+      {/* Daily Revenue Trend */}
+      <div className="bg-white rounded-xl p-4 shadow mb-6">
+        <h3 className="font-semibold text-gray-700 mb-4">
+          📅 Daily Revenue Trend (Last {days} Days)
+        </h3>
+        <ResponsiveContainer width="100%" height={220}>
+          <LineChart data={dailyData}>
+            <CartesianGrid strokeDasharray="3 3" />
+            <XAxis dataKey="date" tick={{ fontSize: 10 }} />
+            <YAxis tick={{ fontSize: 11 }} />
+            <Tooltip formatter={(v) => `₹${v}`} />
+            <Line type="monotone" dataKey="revenue"
+              stroke="#16a34a" strokeWidth={2}
+              dot={false} name="Revenue (₹)" />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+
+      {/* Category Table */}
+      <div className="bg-white rounded-xl shadow overflow-hidden">
+        <table className="w-full text-sm">
+          <thead className="bg-green-700 text-white">
+            <tr>
+              <th className="text-left p-3">Category</th>
+              <th className="text-left p-3">Top Product</th>
+              <th className="text-right p-3">Qty Sold</th>
+              <th className="text-right p-3">Revenue</th>
+              <th className="text-right p-3">Sales Entries</th>
+              <th className="text-right p-3">Avg/Entry</th>
+            </tr>
+          </thead>
+          <tbody>
+            {categories.map((c, i) => (
+              <tr key={c._id} className={`border-t ${i % 2 === 0 ? 'bg-gray-50' : ''}`}>
+                <td className="p-3">
+                  <span className="inline-flex items-center gap-2">
+                    <span className="w-3 h-3 rounded-full"
+                      style={{ backgroundColor: COLORS[i % COLORS.length] }} />
+                    <span className="font-semibold">{c._id}</span>
+                  </span>
+                </td>
+                <td className="p-3 text-gray-500">{c.topProduct}</td>
+                <td className="p-3 text-right">{c.totalQty.toFixed(1)}</td>
+                <td className="p-3 text-right font-semibold text-green-700">
+                  ₹{c.totalRevenue.toLocaleString('en-IN', { maximumFractionDigits: 0 })}
+                </td>
+                <td className="p-3 text-right text-gray-500">{c.salesCount}</td>
+                <td className="p-3 text-right text-gray-500">
+                  ₹{(c.totalRevenue / c.salesCount).toFixed(0)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+          <tfoot>
+            <tr className="border-t bg-green-50 font-bold">
+              <td className="p-3" colSpan={2}>Total</td>
+              <td className="p-3 text-right">{totalQty.toFixed(1)}</td>
+              <td className="p-3 text-right text-green-700">
+                ₹{totalRevenue.toLocaleString('en-IN', { maximumFractionDigits: 0 })}
+              </td>
+              <td className="p-3 text-right">
+                {categories.reduce((s, c) => s + c.salesCount, 0)}
+              </td>
+              <td className="p-3"></td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+    </div>
+  );
+}
+Add Category route to App.jsx
+jsximport CategorySummary from './pages/CategorySummary';
+
+// Add route:
+<Route path="/category" element={<CategorySummary />} />
+Update Navbar.jsx — add Category link
+jsximport { ShoppingBasket, BarChart2, ClipboardList,
+         PlusCircle, Package, PieChart } from 'lucide-react';
+
+const links = [
+  { to: '/',          label: 'Dashboard',  icon: ShoppingBasket },
+  { to: '/predictions', label: 'Predict',  icon: BarChart2 },
+  { to: '/batch',     label: 'Batch',      icon: Package },
+  { to: '/reorder',   label: 'Reorder',    icon: ClipboardList },
+  { to: '/category',  label: 'Categories', icon: PieChart },
+  { to: '/record-sale', label: 'Record',   icon: PlusCircle },
+];
+
+🎉 Phase 4 Complete!
+StepWhatStatusStep 16Record Daily Sales (Single + Bulk mode, stock deduction)✅Step 17Reorder Report (filter, CSV export, days left)✅Step 18Category Summary (Bar, Pie, Line charts + table)✅
+Full Progress
+PhaseStepsStatusPhase 1 — Backend + ML6/6✅ DonePhase 2 — React Frontend6/6✅ DonePhase 3 — ML Enhancements3/3✅ DonePhase 4 — Business Features3/3✅ DonePhase 5 — Polish & UX0/3🔲 NextPhase 6 — Deployment0/3🔲 Pending
+Overall: 18 / 24 steps done (75%)
+
+Ready for Phase 5 — Polish & UX? (Tailwind styling, loading skeletons, toast notifications) Just say "Phase 5"! 🚀You said: Ok phase 5Ok phase 59:50 pmClaude responded: Let's build the Polish & UX!Let's build the Polish & UX! Steps 19–21.
+
+✅ STEP 19 — Tailwind Styling + Mobile Responsive
+frontend/src/index.css (Global Styles)
+css@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * { box-sizing: border-box; }
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    @apply bg-gray-50 text-gray-900 antialiased;
+  }
+  h1, h2, h3 { @apply tracking-tight; }
+}
+
+@layer components {
+  /* Reusable card */
+  .card {
+    @apply bg-white rounded-2xl shadow-sm border border-gray-100 p-5;
+  }
+
+  /* Primary button */
+  .btn-primary {
+    @apply bg-green-700 text-white font-semibold px-5 py-2.5
+           rounded-xl hover:bg-green-800 active:scale-95
+           transition-all duration-150 disabled:opacity-50
+           disabled:cursor-not-allowed;
+  }
+
+  /* Ghost button */
+  .btn-ghost {
+    @apply border border-gray-200 text-gray-600 font-medium px-4 py-2
+           rounded-xl hover:bg-gray-50 active:scale-95
+           transition-all duration-150;
+  }
+
+  /* Badge */
+  .badge {
+    @apply inline-flex items-center gap-1 px-2.5 py-0.5
+           rounded-full text-xs font-bold;
+  }
+
+  /* Table */
+  .table-header {
+    @apply bg-green-700 text-white text-sm font-semibold;
+  }
+  .table-row {
+    @apply border-t border-gray-100 hover:bg-gray-50 transition-colors;
+  }
+
+  /* Input */
+  .input {
+    @apply w-full border border-gray-200 rounded-xl px-3 py-2.5
+           text-sm focus:outline-none focus:ring-2 focus:ring-green-500
+           focus:border-transparent transition;
+  }
+
+  /* Select */
+  .select {
+    @apply border border-gray-200 rounded-xl px-3 py-2 text-sm
+           focus:outline-none focus:ring-2 focus:ring-green-500
+           focus:border-transparent bg-white transition cursor-pointer;
+  }
+}
+frontend/tailwind.config.js (Updated)
+js/** @type {import('tailwindcss').Config} */
+module.exports = {
+  content: ['./src/**/*.{js,jsx,ts,tsx}'],
+  theme: {
+    extend: {
+      colors: {
+        brand: {
+          50:  '#f0fdf4',
+          100: '#dcfce7',
+          500: '#22c55e',
+          600: '#16a34a',
+          700: '#15803d',
+          800: '#166534',
+          900: '#14532d',
+        }
+      },
+      fontFamily: {
+        sans: ['Inter', 'system-ui', 'sans-serif'],
+      },
+      boxShadow: {
+        card: '0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04)',
+        lift: '0 4px 12px rgba(0,0,0,0.08)',
+      },
+      animation: {
+        'fade-in':    'fadeIn 0.3s ease-out',
+        'slide-up':   'slideUp 0.3s ease-out',
+        'pulse-soft': 'pulseSoft 2s infinite',
+      },
+      keyframes: {
+        fadeIn:    { from: { opacity: 0 }, to: { opacity: 1 } },
+        slideUp:   { from: { opacity: 0, transform: 'translateY(8px)' },
+                     to:   { opacity: 1, transform: 'translateY(0)' } },
+        pulseSoft: { '0%,100%': { opacity: 1 }, '50%': { opacity: 0.6 } },
+      },
+    },
+  },
+  plugins: [],
+};
+frontend/src/components/Navbar.jsx (Responsive Mobile Menu)
+jsximport { useState } from 'react';
+import { Link, useLocation } from 'react-router-dom';
+import {
+  ShoppingBasket, BarChart2, ClipboardList,
+  PlusCircle, Package, PieChart, Menu, X
+} from 'lucide-react';
+
+const links = [
+  { to: '/',             label: 'Dashboard',  icon: ShoppingBasket },
+  { to: '/predictions',  label: 'Predict',    icon: BarChart2      },
+  { to: '/batch',        label: 'Batch',      icon: Package        },
+  { to: '/reorder',      label: 'Reorder',    icon: ClipboardList  },
+  { to: '/category',     label: 'Categories', icon: PieChart       },
+  { to: '/record-sale',  label: 'Record',     icon: PlusCircle     },
+];
+
+export default function Navbar() {
+  const { pathname } = useLocation();
+  const [open, setOpen] = useState(false);
+
+  return (
+    <nav className="bg-green-700 text-white shadow-lg sticky top-0 z-50">
+      <div className="max-w-7xl mx-auto px-4">
+        <div className="flex items-center justify-between h-14">
+
+          {/* Logo */}
+          <Link to="/" className="flex items-center gap-2 font-bold text-lg">
+            🛒 <span>KiranaAI</span>
+          </Link>
+
+          {/* Desktop Links */}
+          <div className="hidden md:flex items-center gap-1">
+            {links.map(({ to, label, icon: Icon }) => (
+              <Link key={to} to={to}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg
+                  text-sm font-medium transition-all duration-150
+                  ${pathname === to
+                    ? 'bg-white/20 text-white'
+                    : 'hover:bg-white/10 text-green-100'}`}>
+                <Icon size={14} /> {label}
+              </Link>
+            ))}
+          </div>
+
+          {/* Mobile Hamburger */}
+          <button className="md:hidden p-1.5 rounded-lg hover:bg-white/10"
+            onClick={() => setOpen(!open)}>
+            {open ? <X size={22} /> : <Menu size={22} />}
+          </button>
+        </div>
+
+        {/* Mobile Dropdown */}
+        {open && (
+          <div className="md:hidden pb-3 space-y-1 animate-fade-in">
+            {links.map(({ to, label, icon: Icon }) => (
+              <Link key={to} to={to}
+                onClick={() => setOpen(false)}
+                className={`flex items-center gap-2.5 px-4 py-2.5 rounded-xl
+                  text-sm font-medium transition
+                  ${pathname === to
+                    ? 'bg-white/20'
+                    : 'hover:bg-white/10 text-green-100'}`}>
+                <Icon size={16} /> {label}
+              </Link>
+            ))}
+          </div>
+        )}
+      </div>
+    </nav>
+  );
+}
+
+✅ STEP 20 — Loading Skeletons & Error States
+frontend/src/components/Skeleton.jsx
+jsx// Reusable skeleton primitives
+export function SkeletonBox({ className = '' }) {
+  return (
+    <div className={`bg-gray-200 rounded-xl animate-pulse ${className}`} />
+  );
+}
+
+export function SkeletonCard() {
+  return (
+    <div className="card space-y-3">
+      <div className="flex justify-between items-start">
+        <SkeletonBox className="h-5 w-28" />
+        <SkeletonBox className="h-5 w-12 rounded-full" />
+      </div>
+      <SkeletonBox className="h-4 w-20" />
+      <div className="flex justify-between mt-2">
+        <SkeletonBox className="h-4 w-16" />
+        <SkeletonBox className="h-4 w-16" />
+      </div>
+      <SkeletonBox className="h-2 w-full rounded-full" />
+    </div>
+  );
+}
+
+export function SkeletonTable({ rows = 5, cols = 5 }) {
+  return (
+    <div className="bg-white rounded-2xl shadow overflow-hidden">
+      <div className="bg-gray-200 animate-pulse h-10 w-full" />
+      {Array.from({ length: rows }).map((_, i) => (
+        <div key={i} className="flex gap-4 px-4 py-3 border-t border-gray-100">
+          {Array.from({ length: cols }).map((_, j) => (
+            <SkeletonBox key={j} className="h-4 flex-1" />
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+export function SkeletonChart() {
+  return (
+    <div className="card">
+      <SkeletonBox className="h-5 w-48 mb-4" />
+      <div className="flex items-end gap-2 h-52">
+        {Array.from({ length: 12 }).map((_, i) => (
+          <SkeletonBox key={i}
+            className="flex-1 rounded-lg"
+            style={{ height: `${30 + Math.random() * 70}%` }} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+export function SkeletonKPI({ count = 3 }) {
+  return (
+    <div className={`grid grid-cols-${count} gap-4`}>
+      {Array.from({ length: count }).map((_, i) => (
+        <div key={i} className="card text-center space-y-2">
+          <SkeletonBox className="h-8 w-16 mx-auto" />
+          <SkeletonBox className="h-3 w-20 mx-auto" />
+        </div>
+      ))}
+    </div>
+  );
+}
+frontend/src/components/ErrorState.jsx
+jsximport { AlertTriangle, RefreshCw, WifiOff, Database } from 'lucide-react';
+
+const configs = {
+  network: {
+    icon: WifiOff,
+    title: 'Connection Failed',
+    color: 'text-red-500',
+    bg: 'bg-red-50 border-red-200',
+  },
+  data: {
+    icon: Database,
+    title: 'No Data Found',
+    color: 'text-yellow-500',
+    bg: 'bg-yellow-50 border-yellow-200',
+  },
+  generic: {
+    icon: AlertTriangle,
+    title: 'Something Went Wrong',
+    color: 'text-red-500',
+    bg: 'bg-red-50 border-red-200',
+  },
+};
+
+export default function ErrorState({
+  message = 'An unexpected error occurred.',
+  type = 'generic',
+  onRetry,
+}) {
+  const { icon: Icon, title, color, bg } = configs[type] || configs.generic;
+
+  return (
+    <div className={`rounded-2xl border p-8 text-center ${bg} animate-fade-in`}>
+      <Icon className={`mx-auto mb-3 ${color}`} size={36} />
+      <h3 className="font-bold text-gray-800 text-lg mb-1">{title}</h3>
+      <p className="text-gray-500 text-sm mb-4">{message}</p>
+      {onRetry && (
+        <button onClick={onRetry}
+          className="btn-ghost flex items-center gap-2 mx-auto text-sm">
+          <RefreshCw size={14} /> Try Again
+        </button>
+      )}
+    </div>
+  );
+}
+frontend/src/components/EmptyState.jsx
+jsxexport default function EmptyState({ icon = '📭', title, message, action }) {
+  return (
+    <div className="text-center py-16 animate-fade-in">
+      <div className="text-5xl mb-4">{icon}</div>
+      <h3 className="font-bold text-gray-700 text-lg mb-1">{title}</h3>
+      <p className="text-gray-400 text-sm mb-5">{message}</p>
+      {action}
+    </div>
+  );
+}
+Update frontend/src/pages/Home.jsx — add skeletons + error state
+jsximport { useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { getProducts } from '../api';
+import StockCard from '../components/StockCard';
+import ErrorState from '../components/ErrorState';
+import EmptyState from '../components/EmptyState';
+import { SkeletonCard, SkeletonKPI } from '../components/Skeleton';
+import { AlertTriangle, CheckCircle, Package } from 'lucide-react';
+
+export default function Home() {
+  const [products, setProducts] = useState([]);
+  const [loading, setLoading]   = useState(true);
+  const [error, setError]       = useState('');
+  const navigate = useNavigate();
+
+  const load = () => {
+    setLoading(true); setError('');
+    getProducts()
+      .then(res => setProducts(res.data))
+      .catch(() => setError('Could not connect to the server. Is the backend running?'))
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const lowStock = products.filter(p => p.stockStatus === 'LOW');
+  const okStock  = products.filter(p => p.stockStatus === 'SUFFICIENT');
+
+  return (
+    <div className="animate-slide-up">
+      <div className="flex justify-between items-center mb-6">
+        <h1 className="text-2xl font-bold text-gray-800">📊 Stock Dashboard</h1>
+        <span className="text-xs text-gray-400">
+          Last updated: {new Date().toLocaleTimeString()}
+        </span>
+      </div>
+
+      {/* KPI Cards */}
+      {loading ? (
+        <SkeletonKPI count={3} />
+      ) : (
+        <div className="grid grid-cols-3 gap-4 mb-8">
+          {[
+            { label: 'Total Products', value: products.length,
+              icon: Package, color: 'text-blue-500' },
+            { label: 'Low Stock Items', value: lowStock.length,
+              icon: AlertTriangle, color: 'text-red-500' },
+            { label: 'Sufficient Stock', value: okStock.length,
+              icon: CheckCircle, color: 'text-green-500' },
+          ].map(({ label, value, icon: Icon, color }) => (
+            <div key={label} className="card text-center">
+              <Icon className={`mx-auto mb-2 ${color}`} size={28} />
+              <p className="text-2xl font-bold text-gray-800">{value}</p>
+              <p className="text-sm text-gray-500">{label}</p>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Error */}
+      {error && (
+        <ErrorState type="network" message={error} onRetry={load} />
+      )}
+
+      {/* Low Stock Alert Banner */}
+      {!loading && !error && lowStock.length > 0 && (
+        <div className="bg-red-50 border border-red-200 rounded-2xl p-4 mb-6
+          animate-fade-in flex flex-col sm:flex-row sm:items-center
+          justify-between gap-3">
+          <div>
+            <h2 className="text-red-700 font-bold">⚠️ Reorder Needed</h2>
+            <p className="text-red-500 text-sm mt-0.5">
+              {lowStock.map(p => p.name).join(', ')} — below minimum threshold
+            </p>
+          </div>
+          <button onClick={() => navigate('/reorder')}
+            className="btn-primary text-sm whitespace-nowrap">
+            View Reorder Report →
+          </button>
+        </div>
+      )}
+
+      {/* Stock Grids */}
+      {loading ? (
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          {Array.from({ length: 6 }).map((_, i) => <SkeletonCard key={i} />)}
+        </div>
+      ) : !error && (
+        <>
+          {lowStock.length > 0 && (
+            <>
+              <h2 className="text-base font-semibold text-red-600 mb-3">
+                ⚠ Needs Reorder
+              </h2>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-6">
+                {lowStock.map(p => (
+                  <StockCard key={p._id} product={p}
+                    onClick={() => navigate('/predictions',
+                      { state: { product: p } })} />
+                ))}
+              </div>
+            </>
+          )}
+
+          <h2 className="text-base font-semibold text-green-700 mb-3">
+            ✓ Sufficient Stock
+          </h2>
+          {okStock.length === 0 ? (
+            <EmptyState icon="📦"
+              title="No Sufficient Stock Items"
+              message="All products need attention!" />
+          ) : (
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+              {okStock.map(p => (
+                <StockCard key={p._id} product={p}
+                  onClick={() => navigate('/predictions',
+                    { state: { product: p } })} />
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+✅ STEP 21 — Toast Notifications (Low Stock Alerts)
+frontend/src/components/Toast.jsx
+jsximport { useEffect, useState } from 'react';
+import { CheckCircle, AlertTriangle, XCircle, Info, X } from 'lucide-react';
+
+const icons = {
+  success: { Icon: CheckCircle, cls: 'text-green-500', bar: 'bg-green-500',
+             bg: 'bg-white border-green-200' },
+  error:   { Icon: XCircle,     cls: 'text-red-500',   bar: 'bg-red-500',
+             bg: 'bg-white border-red-200' },
+  warning: { Icon: AlertTriangle, cls: 'text-yellow-500', bar: 'bg-yellow-500',
+             bg: 'bg-white border-yellow-200' },
+  info:    { Icon: Info,        cls: 'text-blue-500',  bar: 'bg-blue-500',
+             bg: 'bg-white border-blue-200' },
+};
+
+function Toast({ id, type = 'info', message, duration = 4000, onClose }) {
+  const [visible, setVisible] = useState(true);
+  const { Icon, cls, bar, bg } = icons[type] || icons.info;
+
+  useEffect(() => {
+    const t = setTimeout(() => {
+      setVisible(false);
+      setTimeout(() => onClose(id), 300);
+    }, duration);
+    return () => clearTimeout(t);
+  }, []);
+
+  return (
+    <div className={`relative flex items-start gap-3 w-80 rounded-2xl border
+      shadow-lift px-4 py-3 overflow-hidden transition-all duration-300
+      ${bg} ${visible ? 'opacity-100 translate-x-0' : 'opacity-0 translate-x-4'}`}>
+
+      {/* Progress bar */}
+      <div className={`absolute bottom-0 left-0 h-1 ${bar} rounded-b-2xl`}
+        style={{
+          animation: `shrink ${duration}ms linear forwards`,
+        }} />
+
+      <Icon className={`mt-0.5 shrink-0 ${cls}`} size={18} />
+      <p className="text-sm text-gray-700 flex-1 font-medium">{message}</p>
+      <button onClick={() => { setVisible(false); setTimeout(() => onClose(id), 300); }}
+        className="text-gray-300 hover:text-gray-500 transition shrink-0">
+        <X size={14} />
+      </button>
+    </div>
+  );
+}
+
+// ── Toast Container ────────────────────────────────────────
+let _addToast = null;
+
+export function ToastContainer() {
+  const [toasts, setToasts] = useState([]);
+
+  _addToast = (toast) => {
+    const id = Date.now();
+    setToasts(t => [...t, { ...toast, id }]);
+  };
+
+  const remove = (id) => setToasts(t => t.filter(x => x.id !== id));
+
+  return (
+    <div className="fixed bottom-5 right-5 z-50 flex flex-col gap-2">
+      <style>{`
+        @keyframes shrink {
+          from { width: 100%; }
+          to   { width: 0%; }
+        }
+      `}</style>
+      {toasts.map(t => (
+        <Toast key={t.id} {...t} onClose={remove} />
+      ))}
+    </div>
+  );
+}
+
+// ── Toast API (call anywhere) ──────────────────────────────
+export const toast = {
+  success: (message, duration) => _addToast?.({ type: 'success', message, duration }),
+  error:   (message, duration) => _addToast?.({ type: 'error',   message, duration }),
+  warning: (message, duration) => _addToast?.({ type: 'warning', message, duration }),
+  info:    (message, duration) => _addToast?.({ type: 'info',    message, duration }),
+};
+Update frontend/src/App.jsx — add ToastContainer + auto low stock alert
+jsximport { BrowserRouter, Routes, Route } from 'react-router-dom';
+import { useEffect } from 'react';
+import Navbar          from './components/Navbar';
+import { ToastContainer, toast } from './components/Toast';
+import { getProducts } from './api';
+
+import Home            from './pages/Home';
+import Predictions     from './pages/Predictions';
+import BatchPredictions from './pages/BatchPredictions';
+import ReorderReport   from './pages/ReorderReport';
+import RecordSale      from './pages/RecordSale';
+import CategorySummary from './pages/CategorySummary';
+
+export default function App() {
+
+  // Auto-check low stock on app load
+  useEffect(() => {
+    getProducts().then(res => {
+      const lowItems = res.data.filter(p => p.stockStatus === 'LOW');
+      if (lowItems.length > 0) {
+        setTimeout(() => {
+          toast.warning(
+            `⚠️ ${lowItems.length} item(s) need reorder: ${
+              lowItems.slice(0, 2).map(p => p.name).join(', ')
+            }${lowItems.length > 2 ? '...' : ''}`,
+            6000
+          );
+        }, 1000);
+      } else {
+        setTimeout(() => {
+          toast.success('✅ All stock levels are sufficient!', 3000);
+        }, 1000);
+      }
+    }).catch(() => {
+      toast.error('❌ Could not connect to backend server.', 5000);
+    });
+  }, []);
+
+  return (
+    <BrowserRouter>
+      <div className="min-h-screen bg-gray-50">
+        <Navbar />
+        <div className="max-w-7xl mx-auto px-4 py-6">
+          <Routes>
+            <Route path="/"              element={<Home />} />
+            <Route path="/predictions"   element={<Predictions />} />
+            <Route path="/batch"         element={<BatchPredictions />} />
+            <Route path="/reorder"       element={<ReorderReport />} />
+            <Route path="/category"      element={<CategorySummary />} />
+            <Route path="/record-sale"   element={<RecordSale />} />
+          </Routes>
+        </div>
+        <ToastContainer />
+      </div>
+    </BrowserRouter>
+  );
+}
+Use toast in RecordSale, ReorderReport pages
+jsx// In RecordSale.jsx — replace setMsg/setError with toasts:
+import { toast } from '../components/Toast';
+
+// On success:
+toast.success(`✅ ${payload.length} sale(s) recorded for ${date}!`);
+
+// On error:
+toast.error(err.response?.data?.error || 'Failed to record sale');
+jsx// In ReorderReport.jsx — after load completes:
+import { toast } from '../components/Toast';
+
+// Inside load() after setReport(rows):
+const criticalCount = rows.filter(r => r.urgency === 'CRITICAL').length;
+if (criticalCount > 0) {
+  toast.warning(`🔴 ${criticalCount} product(s) in CRITICAL stock!`, 5000);
+}
+frontend/src/components/StockCard.jsx (Polished Final Version)
+jsximport { TrendingUp, TrendingDown, Minus } from 'lucide-react';
+
+export default function StockCard({ product, onClick }) {
+  const isLow     = product.stockStatus === 'LOW';
+  const stockPct  = Math.min(100,
+    (product.currentStock / (product.minThreshold * 3)) * 100
+  );
+
+  return (
+    <div onClick={() => onClick(product)}
+      className={`cursor-pointer rounded-2xl p-4 border-l-4 shadow-card
+        hover:shadow-lift hover:-translate-y-0.5 transition-all duration-200
+        animate-fade-in
+        ${isLow
+          ? 'border-red-400 bg-red-50 hover:bg-red-100/50'
+          : 'border-green-500 bg-white hover:bg-green-50/30'}`}>
+
+      {/* Header */}
+      <div className="flex justify-between items-start mb-3">
+        <div>
+          <h3 className="font-bold text-gray-800">{product.name}</h3>
+          <p className="text-xs text-gray-400 mt-0.5">{product.category}</p>
+        </div>
+        <span className={`badge text-xs
+          ${isLow
+            ? 'bg-red-100 text-red-700'
+            : 'bg-green-100 text-green-700'}`}>
+          {isLow ? '⚠ LOW' : '✓ OK'}
+        </span>
+      </div>
+
+      {/* Stock Info */}
+      <div className="flex justify-between text-sm mb-3">
+        <div>
+          <p className="text-gray-400 text-xs">Current</p>
+          <p className="font-bold text-gray-800">
+            {product.currentStock} <span className="text-xs font-normal text-gray-400">
+              {product.unit}
+            </span>
+          </p>
+        </div>
+        <div className="text-right">
+          <p className="text-gray-400 text-xs">Min Level</p>
+          <p className="font-semibold text-gray-600">
+            {product.minThreshold} <span className="text-xs font-normal text-gray-400">
+              {product.unit}
+            </span>
+          </p>
+        </div>
+      </div>
+
+      {/* Progress Bar */}
+      <div className="w-full bg-gray-100 rounded-full h-1.5 mb-2">
+        <div
+          className={`h-1.5 rounded-full transition-all duration-500
+            ${stockPct < 33 ? 'bg-red-500' :
+              stockPct < 66 ? 'bg-yellow-500' : 'bg-green-500'}`}
+          style={{ width: `${stockPct}%` }} />
+      </div>
+
+      <p className="text-xs text-gray-400 text-right">
+        {stockPct.toFixed(0)}% of safe level · click to predict →
+      </p>
+    </div>
+  );
+}
+
+🎉 Phase 5 Complete!
+StepWhatStatusStep 19Tailwind design system (card, btn, input classes + animations)✅Step 20Loading skeletons + Error states + Empty states✅Step 21Toast notifications (auto low-stock alert on load)✅
+Full Progress
+PhaseStepsStatusPhase 1 — Backend + ML6/6✅ DonePhase 2 — React Frontend6/6✅ DonePhase 3 — ML Enhancements3/3✅ DonePhase 4 — Business Features3/3✅ DonePhase 5 — Polish & UX3/3✅ DonePhase 6 — Deployment0/3🔲 Next
+Overall: 21 / 24 steps done (87%)
+
+What's Working Now 🚀
+✅ Dashboard with skeleton loading + error handling
+✅ Stock cards with animated progress bars
+✅ Prediction charts with confidence bands
+✅ Batch ML forecasting for all products
+✅ Reorder report with CSV export + urgency filters
+✅ Category charts (Bar + Pie + Line)
+✅ Bulk sales recording with stock deduction
+✅ Toast alerts auto-firing on low stock
+✅ Mobile responsive hamburger menu
+✅ Smooth fade-in / slide-up animations
+
+Ready for the final Phase 6 — Deployment? (Docker + Railway/Render + Vercel) Just say "Phase 6"! 🚀You said: Ok Phase 6Ok Phase 610:27 pmClaude responded: Let's deploy the full system!Let's deploy the full system! Steps 22–24.
+
+✅ STEP 22 — Dockerize All 3 Services
+backend/Dockerfile
+dockerfile# ── Stage 1: Build ─────────────────────────────────────────
+FROM node:18-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production
+
+# ── Stage 2: Run ───────────────────────────────────────────
+FROM node:18-alpine
+WORKDIR /app
+COPY --from=builder /app/node_modules ./node_modules
+COPY . .
+
+EXPOSE 5000
+CMD ["node", "server.js"]
+ml-service/Dockerfile
+dockerfileFROM python:3.11-slim
+WORKDIR /app
+
+# System deps for Prophet
+RUN apt-get update && apt-get install -y \
+    gcc g++ build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+EXPOSE 8000
+CMD ["python", "app.py"]
+ml-service/requirements.txt
+txtflask==3.0.0
+flask-cors==4.0.0
+prophet==1.1.5
+pandas==2.1.4
+numpy==1.26.2
+scikit-learn==1.3.2
+gunicorn==21.2.0
+frontend/Dockerfile
+dockerfile# ── Stage 1: Build React ───────────────────────────────────
+FROM node:18-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+
+# Inject production API URL at build time
+ARG REACT_APP_API_URL
+ENV REACT_APP_API_URL=$REACT_APP_API_URL
+RUN npm run build
+
+# ── Stage 2: Serve with Nginx ──────────────────────────────
+FROM nginx:alpine
+COPY --from=builder /app/build /usr/share/nginx/html
+
+# React Router support (all routes → index.html)
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+frontend/nginx.conf
+nginxserver {
+    listen 80;
+    server_name _;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # React Router — serve index.html for all routes
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Cache static assets
+    location /static/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # Gzip
+    gzip on;
+    gzip_types text/plain text/css application/json
+               application/javascript text/xml application/xml;
+}
+docker-compose.yml (Root — Local Dev + Production)
+yamlversion: '3.9'
+
+services:
+
+  # ── MongoDB ─────────────────────────────────────────────
+  mongo:
+    image: mongo:7
+    container_name: kirana_mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - kirana_net
+
+  # ── Backend (Node/Express) ───────────────────────────────
+  backend:
+    build: ./backend
+    container_name: kirana_backend
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      PORT: 5000
+      MONGO_URI: mongodb://mongo:27017/kirana_db
+      ML_SERVICE_URL: http://ml_service:8000
+    depends_on:
+      - mongo
+      - ml_service
+    networks:
+      - kirana_net
+
+  # ── ML Service (Python/Flask) ────────────────────────────
+  ml_service:
+    build: ./ml-service
+    container_name: kirana_ml
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    networks:
+      - kirana_net
+
+  # ── Frontend (React + Nginx) ─────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        REACT_APP_API_URL: http://localhost:5000/api
+    container_name: kirana_frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    networks:
+      - kirana_net
+
+volumes:
+  mongo_data:
+
+networks:
+  kirana_net:
+    driver: bridge
+.dockerignore files
+backend/.dockerignore
+node_modules
+.env
+*.log
+seed/
+ml-service/.dockerignore
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+frontend/.dockerignore
+node_modules
+build
+.env*
+Root .gitignore
+# Dependencies
+node_modules/
+venv/
+
+# Env files
+.env
+.env.local
+.env.production
+
+# Build
+build/
+dist/
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+npm-debug.log*
+
+# Docker volumes
+mongo_data/
+
+# OS
+.DS_Store
+Thumbs.db
+Run Everything Locally with Docker
+bash# From project root
+docker-compose up --build
+
+# Seed data inside Docker
+docker exec kirana_backend node seed/seedData.js
+
+# Verify services
+curl http://localhost:5000/         # Backend
+curl http://localhost:8000/health   # ML Service
+open http://localhost:3000          # Frontend
+
+✅ STEP 23 — Deploy Backend + ML to Render
+23.1 — Prepare Backend for Render
+Update backend/server.js — production CORS:
+jsconst cors = require('cors');
+
+const allowedOrigins = [
+  'http://localhost:3000',
+  process.env.FRONTEND_URL,  // set in Render env vars
+].filter(Boolean);
+
+app.use(cors({
+  origin: allowedOrigins,
+  credentials: true,
+}));
+Update backend/.env.example:
+envPORT=5000
+MONGO_URI=mongodb+srv://<user>:<pass>@cluster.mongodb.net/kirana_db
+ML_SERVICE_URL=https://kirana-ml.onrender.com
+FRONTEND_URL=https://kirana-ai.vercel.app
+Update ml-service/app.py — production host:
+python# Replace the last 2 lines with:
+if __name__ == '__main__':
+    import os
+    port = int(os.environ.get('PORT', 8000))
+    app.run(host='0.0.0.0', port=port, debug=False)
+23.2 — MongoDB Atlas (Free Cloud DB)
+1. Go to https://cloud.mongodb.com
+2. Create free M0 cluster
+3. Create DB user → copy connection string
+4. Whitelist IP: 0.0.0.0/0 (allow all for Render)
+5. Connection string format:
+   mongodb+srv://user:pass@cluster.mongodb.net/kirana_db
+23.3 — Push to GitHub
+bash# From project root
+git init
+git add .
+git commit -m "feat: kirana demand prediction system"
+git remote add origin https://github.com/YOUR_USERNAME/kirana-demand-system
+git push -u origin main
+23.4 — Deploy ML Service on Render
+1. Go to https://render.com → New → Web Service
+2. Connect your GitHub repo
+3. Settings:
+   ├── Name:        kirana-ml-service
+   ├── Root Dir:    ml-service
+   ├── Runtime:     Python 3
+   ├── Build Cmd:   pip install -r requirements.txt
+   └── Start Cmd:   gunicorn app:app --bind 0.0.0.0:$PORT
+4. Plan: Free
+5. Click Deploy
+6. Copy URL: https://kirana-ml-service.onrender.com
+23.5 — Deploy Backend on Render
+1. New → Web Service
+2. Settings:
+   ├── Name:        kirana-backend
+   ├── Root Dir:    backend
+   ├── Runtime:     Node
+   ├── Build Cmd:   npm install
+   └── Start Cmd:   node server.js
+3. Environment Variables:
+   ├── PORT          = 5000
+   ├── MONGO_URI     = mongodb+srv://...  (Atlas URI)
+   ├── ML_SERVICE_URL = https://kirana-ml-service.onrender.com
+   └── FRONTEND_URL  = https://kirana-ai.vercel.app
+4. Click Deploy
+5. Copy URL: https://kirana-backend.onrender.com
+23.6 — Seed Production Database
+bash# Run once after backend deploys
+MONGO_URI="mongodb+srv://user:pass@cluster.mongodb.net/kirana_db" \
+  node backend/seed/seedData.js
+
+✅ STEP 24 — Deploy React Frontend to Vercel
+24.1 — Update API URL for Production
+frontend/src/api/index.js (final):
+jsimport axios from 'axios';
+
+const BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:5000/api';
+
+const API = axios.create({
+  baseURL: BASE_URL,
+  timeout: 30000,  // 30s timeout (Render free tier cold starts)
+});
+
+// Request interceptor — log in dev
+API.interceptors.request.use(config => {
+  if (process.env.NODE_ENV === 'development') {
+    console.log(`→ ${config.method?.toUpperCase()} ${config.url}`);
+  }
+  return config;
+});
+
+// Response interceptor — global error handling
+API.interceptors.response.use(
+  res => res,
+  err => {
+    const msg = err.response?.data?.error || err.message || 'Network error';
+    console.error('API Error:', msg);
+    return Promise.reject(err);
+  }
+);
+
+export const getProducts        = ()         => API.get('/products');
+export const createProduct      = (data)     => API.post('/products', data);
+export const updateStock        = (id, qty)  => API.put(`/products/${id}/stock`, { currentStock: qty });
+
+export const getSales           = (id, days) => API.get(`/sales/${id}?days=${days}`);
+export const recordSale         = (data)     => API.post('/sales', data);
+export const recordBulkSales    = (sales)    => API.post('/sales/bulk', { sales });
+export const getDailySummary    = (days)     => API.get(`/sales/summary/daily?days=${days}`);
+export const getCategorySummary = (days)     => API.get(`/sales/summary/category?days=${days}`);
+
+export const getPrediction      = (id, days) => API.get(`/predictions/${id}?days=${days}`);
+export const getBatchPredict    = (days = 7) => API.get(`/predictions/batch/all?days=${days}`);
+frontend/.env.production
+envREACT_APP_API_URL=https://kirana-backend.onrender.com/api
+frontend/.env.development
+envREACT_APP_API_URL=http://localhost:5000/api
+24.2 — Deploy to Vercel
+1. Go to https://vercel.com → New Project
+2. Import your GitHub repo
+3. Settings:
+   ├── Framework:    Create React App
+   ├── Root Dir:     frontend
+   └── Build Cmd:    npm run build
+4. Environment Variables:
+   └── REACT_APP_API_URL = https://kirana-backend.onrender.com/api
+5. Click Deploy
+6. Live URL: https://kirana-ai.vercel.app
+vercel.json (inside /frontend)
+json{
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/index.html" }
+  ],
+  "headers": [
+    {
+      "source": "/static/(.*)",
+      "headers": [
+        { "key": "Cache-Control", "value": "public, max-age=31536000, immutable" }
+      ]
+    }
+  ]
+}
+
+🔒 Production Checklist
+bash# backend/.env (production — never commit)
+PORT=5000
+MONGO_URI=mongodb+srv://...
+ML_SERVICE_URL=https://kirana-ml-service.onrender.com
+FRONTEND_URL=https://kirana-ai.vercel.app
+
+# Verify all 3 services are live:
+curl https://kirana-backend.onrender.com/
+curl https://kirana-ml-service.onrender.com/health
+open https://kirana-ai.vercel.app
+
+🔧 Cold Start Fix (Render Free Tier)
+Render free services sleep after 15 min inactivity.
+
+Add this to frontend/src/api/index.js:
+js// Warm up backend + ML on app load
+export const warmUpServices = async () => {
+  try {
+    await Promise.all([
+      axios.get(`${BASE_URL.replace('/api','')}/`),
+      axios.get(
+        `${process.env.REACT_APP_ML_URL ||
+          'https://kirana-ml-service.onrender.com'}/health`
+      ),
+    ]);
+    console.log('Services warmed up ✅');
+  } catch {
+    console.log('Warm-up ping sent');
+  }
+};
+Call it in App.jsx:
+jsximport { warmUpServices } from './api';
+
+useEffect(() => {
+  warmUpServices(); // ping on first load
+}, []);
+
+🎉 PROJECT COMPLETE!
+PhaseStepsStatusPhase 1 — Backend + ML Setup6/6✅ DonePhase 2 — React Frontend6/6✅ DonePhase 3 — ML Enhancements3/3✅ DonePhase 4 — Business Features3/3✅ DonePhase 5 — Polish & UX3/3✅ DonePhase 6 — Deployment3/3✅ Done
+Overall: 24 / 24 steps done (100%) 🏆
+
+🛒 What You've Built
+KiranaAI — Full Stack ML Demand Prediction System
+
+Frontend  →  React + Tailwind + Recharts (Vercel)
+Backend   →  Node.js + Express + MongoDB (Render)
+ML Layer  →  Python + Flask + Prophet (Render)
+Database  →  MongoDB Atlas (Free Cloud)
+
+Features:
+✅ Prophet time-series forecasting per product
+✅ Batch ML predictions for all products at once
+✅ Reorder report with CRITICAL/HIGH/ORDER urgency
+✅ Category-wise revenue breakdown (Bar+Pie+Line)
+✅ Daily + bulk sales recording with stock deduction
+✅ Accuracy scoring (MAE, RMSE, MAPE, trend detection)
+✅ Toast notifications + skeleton loaders + error states
+✅ Mobile responsive with hamburger menu
+✅ CSV export for reorder report
+✅ Fully Dockerized (docker-compose up --build)
+✅ Deployed on Vercel + Render + MongoDB Atlas
+
+🚀 Quick Start Commands
+bash# Local Development (no Docker)
+mongod &
+cd backend   && npm run dev &
+cd ml-service && python app.py &
+cd frontend  && npm start
+
+# Local with Docker
+docker-compose up --build
+docker exec kirana_backend node seed/seedData.js
+
+# Production Deploy
+git push origin main  # auto-deploys to Vercel + Render
+Congratulations on building KiranaAI from scratch! 🎉 Let me know if you need help with any bugs, feature additions, or customizations!
