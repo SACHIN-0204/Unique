@@ -3,7 +3,10 @@ from flask_cors import CORS
 import os
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins=[
+    "https://kirana.vercel.app",  # your stable production domain
+    "http://localhost:3000"
+])
 
 # ── Health Check ──────────────────────────────────────────
 @app.route('/health', methods=['GET'])
