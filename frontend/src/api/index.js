@@ -38,4 +38,18 @@ export const getCategorySummary = (days)     => API.get(`/sales/summary/category
 
 export const getPrediction    = (id, days)  => API.get(`/predictions/${id}?days=${days}`);
 export const getBatchPredict  = (days = 7)  => API.get(`/predictions/batch/all?days=${days}`);
+export const warmUpServices = async () => {
+  try {
+    await Promise.all([
+      axios.get(`${BASE_URL.replace('/api','')}/`),
+      axios.get(
+        `${process.env.REACT_APP_ML_URL ||
+          'https://kirana-ml-service.onrender.com'}/health`
+      ),
+    ]);
+    console.log('Services warmed up ✅');
 
+  } catch {
+     console.log('Warm-up ping sent');
+  }
+}

@@ -10,8 +10,13 @@ import ReorderReport from './pages/ReorderReport';
 import RecordSale from './pages/RecordSales';
 import BatchPredictions from './pages/BatchPredictions';
 import CategorySummary from './pages/CategorySummary';
+import { warmUpServices } from './api';
 
 export default function App() {
+
+  useEffect(() => {
+  warmUpServices(); // ping on first load
+}, []);
 
    // Auto-check low stock on app load
   useEffect(() => {
