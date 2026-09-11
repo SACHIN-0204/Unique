@@ -4,7 +4,7 @@ import os
 
 app = Flask(__name__)
 CORS(app, origins=[
-    "https://kirana.vercel.app",  # your stable production domain
+    "kirana-ai-mu.vercel.app",  # your stable production domain
     "http://localhost:3000"
 ])
 
