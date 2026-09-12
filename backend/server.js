@@ -7,32 +7,11 @@ const app = express();
 
 const allowedOrigins = [
   'http://localhost:3000',
-  'https://kirana-ai.vercel.app',
-  'https://kirana-ai-mu.vercel.app',
-  process.env.FRONTEND_URL,
-].flatMap(origin => origin ? origin.split(',').map(value => {
-  const trimmed = value.trim();
-  return trimmed && /^https?:\/\//i.test(trimmed)
-    ? trimmed.replace(/\/$/, '')
-    : trimmed ? `https://${trimmed.replace(/\/$/, '')}` : null;
-}).filter(Boolean) : []);
+  process.env.FRONTEND_URL,  // set in Render env vars
+].filter(Boolean);
 
 app.use(cors({
-  origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-
-    // Allow Vercel preview deployments and Render-hosted frontends.
-    if (
-      /^https:\/\/[a-z0-9-]+(?:\.[a-z0-9-]+)*\.vercel\.app$/i.test(origin) ||
-      /^https:\/\/[a-z0-9-]+(?:\.[a-z0-9-]+)*\.onrender\.com$/i.test(origin)
-    ) {
-      return callback(null, true);
-    }
-
-    return callback(new Error('Origin not allowed by CORS'));
-  },
+  origin: allowedOrigins,
   credentials: true,
 }));
 app.use(express.json());
